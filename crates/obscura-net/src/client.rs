@@ -305,6 +305,27 @@ pub async fn read_body_capped(
     Ok(buf)
 }
 
+/// SameSite context for a navigation hop (COOK-04). `None` initiator =
+/// user/CDP-initiated, treated as same-site (all cookies sent — the legacy
+/// behaviour). For a page-initiated navigation, a cross-site destination
+/// withholds `Strict` always and `Lax` on unsafe methods; a safe (GET/HEAD)
+/// top-level cross-site navigation still sends `Lax`, matching browsers.
+fn nav_same_site_context(
+    initiator: Option<&Url>,
+    dest: &Url,
+    method: &Method,
+) -> crate::cookies::SameSiteContext {
+    use crate::cookies::SameSiteContext;
+    match initiator {
+        None => SameSiteContext::SameSite,
+        Some(init) if crate::cookies::is_same_site(init, dest) => SameSiteContext::SameSite,
+        Some(_) if *method == Method::GET || *method == Method::HEAD => {
+            SameSiteContext::CrossSiteTopLevel
+        }
+        Some(_) => SameSiteContext::CrossSite,
+    }
+}
+
 /// SSRF guard shared by every HTTP path in this crate. Rejects non-`http`/
 /// `https`/`file` schemes unconditionally, and — unless `allow_private_network`
 /// is set (flag or `OBSCURA_ALLOW_PRIVATE_NETWORK`) — IP-literal hosts that are
@@ -545,11 +566,47 @@ impl ObscuraHttpClient {
         self.fetch_with_method(Method::POST, url, Some(body.as_bytes().to_vec())).await
     }
 
+    /// GET navigation carrying the initiating site, so SameSite cookies are
+    /// enforced at egress (COOK-04). `initiator = None` = user/CDP-initiated.
+    pub async fn fetch_with_initiator(
+        &self,
+        url: &Url,
+        initiator: Option<&Url>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_navigation(Method::GET, url, None, initiator).await
+    }
+
+    /// POST navigation carrying the initiating site (COOK-04).
+    pub async fn post_form_navigation(
+        &self,
+        url: &Url,
+        body: &str,
+        initiator: Option<&Url>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_navigation(Method::POST, url, Some(body.as_bytes().to_vec()), initiator)
+            .await
+    }
+
     pub async fn fetch_with_method(
         &self,
         initial_method: Method,
         url: &Url,
         initial_body: Option<Vec<u8>>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_navigation(initial_method, url, initial_body, None).await
+    }
+
+    /// Like [`Self::fetch_with_method`] but carries the initiating top-level site
+    /// so SameSite cookies are enforced at egress (COOK-04). `initiator = None`
+    /// means user/CDP-initiated (treated as same-site — all cookies sent); pass
+    /// the document that triggered a navigation to withhold `Strict` (and, on an
+    /// unsafe method, `Lax`) cookies when the navigation is cross-site.
+    pub async fn fetch_navigation(
+        &self,
+        initial_method: Method,
+        url: &Url,
+        initial_body: Option<Vec<u8>>,
+        initiator: Option<&Url>,
     ) -> Result<Response, ObscuraNetError> {
         validate_url(url, self.allow_private_network)?;
 
@@ -652,7 +709,10 @@ impl ObscuraHttpClient {
                 HeaderValue::from_static("1"),
             );
 
-            let cookie_header = self.cookie_jar.get_cookie_header(&current_url);
+            // COOK-04: enforce SameSite using the initiating site of this
+            // navigation. None (user/CDP-initiated) keeps the legacy "send all".
+            let ss_ctx = nav_same_site_context(initiator, &current_url, &method);
+            let cookie_header = self.cookie_jar.get_cookie_header_ctx(&current_url, ss_ctx);
             tracing::debug!(
                 "Cookie header for {}: {} cookies ({} bytes)",
                 current_url.host_str().unwrap_or("?"),
@@ -1019,5 +1079,32 @@ mod ssrf_guard_tests {
         // A `..` traversal that climbs out of the root resolves outside -> rejected.
         let escape = root.path().join("..").join(other.path().file_name().unwrap()).join("secret.txt");
         assert!(enforce_file_root(&escape, root.path()).is_err(), "traversal escape must be denied");
+    }
+
+    // COOK-04: the navigation SameSite context derived from the initiating site.
+    #[test]
+    fn nav_same_site_context_classifies() {
+        use crate::cookies::SameSiteContext;
+        let u = |s: &str| Url::parse(s).unwrap();
+        let evil = u("https://evil.com/");
+        let bank = u("https://bank.com/");
+        let bank_sub = u("https://app.bank.com/");
+        // No initiator (user/CDP-initiated) -> same-site, send all.
+        assert_eq!(nav_same_site_context(None, &bank, &Method::GET), SameSiteContext::SameSite);
+        // Same registrable domain -> same-site.
+        assert_eq!(
+            nav_same_site_context(Some(&bank_sub), &bank, &Method::GET),
+            SameSiteContext::SameSite
+        );
+        // Cross-site safe navigation -> top-level (Lax sent, Strict withheld).
+        assert_eq!(
+            nav_same_site_context(Some(&evil), &bank, &Method::GET),
+            SameSiteContext::CrossSiteTopLevel
+        );
+        // Cross-site unsafe method -> cross-site (Lax withheld too).
+        assert_eq!(
+            nav_same_site_context(Some(&evil), &bank, &Method::POST),
+            SameSiteContext::CrossSite
+        );
     }
 }

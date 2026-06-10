@@ -682,6 +682,36 @@ fn same_site_allows(same_site: &str, ctx: SameSiteContext) -> bool {
     }
 }
 
+/// Registrable domain (eTLD+1) of a host, used for the same-site comparison.
+/// `www.example.com` and `api.example.com` -> `example.com`; for a host directly
+/// under a multi-label / private public suffix (`a.azurewebsites.net`) the host
+/// itself is the registrable domain, so two tenants are correctly *not* same-site.
+fn registrable_domain(host: &str) -> String {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() || host.parse::<std::net::IpAddr>().is_ok() {
+        return host; // IP literal (or empty): the literal is its own site
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    for i in 0..labels.len() {
+        if is_public_suffix(&labels[i..].join(".")) {
+            // eTLD+1 = the public suffix plus one more label to its left.
+            return labels[i.saturating_sub(1)..].join(".");
+        }
+    }
+    host
+}
+
+/// True if two URLs are "same-site" — same registrable domain (eTLD+1) — for
+/// SameSite cookie enforcement (COOK-04). Scheme/port are irrelevant to
+/// same-site (unlike same-origin). A missing host on either side is not
+/// same-site (fail-safe).
+pub fn is_same_site(a: &Url, b: &Url) -> bool {
+    match (a.host_str(), b.host_str()) {
+        (Some(ha), Some(hb)) => registrable_domain(ha) == registrable_domain(hb),
+        _ => false,
+    }
+}
+
 /// RFC 6265 §5.1.4 path-match. The previous `request_path.starts_with(cookie_path)`
 /// leaked a cookie scoped to `Path=/admin` onto `/administrator` / `/admin-x`
 /// (COOK-PATH-BOUND-1). A match requires an exact equality, a cookie-path that
@@ -1204,5 +1234,23 @@ mod tests {
         let cross = jar.get_cookie_header_ctx(&url, SameSiteContext::CrossSite);
         assert!(!cross.contains("strict=s") && !cross.contains("lax=l"), "got '{}'", cross);
         assert!(cross.contains("nonec=n"));
+    }
+
+    #[test]
+    fn same_site_registrable_domain_comparison() {
+        let u = |s: &str| Url::parse(s).unwrap();
+        // Same registrable domain across subdomains / scheme / port.
+        assert!(is_same_site(&u("https://www.example.com/"), &u("https://api.example.com/")));
+        assert!(is_same_site(&u("http://example.com:80/"), &u("https://example.com/")));
+        // Different registrable domains.
+        assert!(!is_same_site(&u("https://bank.com/"), &u("https://evil.com/")));
+        // Cross-tenant under a PRIVATE public suffix is NOT same-site.
+        assert!(!is_same_site(
+            &u("https://a.azurewebsites.net/"),
+            &u("https://b.azurewebsites.net/")
+        ));
+        // Same tenant under a multi-label suffix IS same-site.
+        assert!(is_same_site(&u("https://x.shop.co.uk/"), &u("https://y.shop.co.uk/")));
+        assert!(!is_same_site(&u("https://shop.co.uk/"), &u("https://other.co.uk/")));
     }
 }

@@ -12,7 +12,7 @@ pub use client::{
     read_body_capped, redact_proxy, ObscuraHttpClient, ObscuraNetError, RequestInfo, ResourceType,
     Response, SsrfDnsResolver,
 };
-pub use cookies::{CookieInfo, CookieJar, SameSiteContext};
+pub use cookies::{is_same_site, CookieInfo, CookieJar, SameSiteContext};
 pub use encoding::{
     decode_non_html, decode_response, decode_response_with_name, decode_with_label, label_name,
     url_encode_query,
