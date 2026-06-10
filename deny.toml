@@ -1,5 +1,11 @@
 # cargo-deny configuration — https://embarkstudios.github.io/cargo-deny/
-# Run: cargo deny check advisories bans sources
+# CI runs: cargo deny check advisories bans sources licenses (with --all-features)
+
+[graph]
+# Evaluate the FULL feature graph — including the optional `stealth` feature, which
+# pulls the wreq / BoringSSL tree — so the checks below match CI's --all-features
+# run and a license/advisory in an optional feature can't slip past a local check.
+all-features = true
 
 [advisories]
 # Real vulnerabilities fail the build. The advisories below are *unmaintained*
@@ -19,8 +25,8 @@ multiple-versions = "warn"
 wildcards = "allow"
 
 [licenses]
-# Permissive allow-list (starting point — tune as the dependency tree evolves).
-# Not enforced by the default CI command yet; documented here for when it is.
+# Permissive allow-list, enforced in CI (DENY-NO-LICENSES-N4):
+# `cargo deny check ... licenses`.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -35,8 +41,27 @@ allow = [
     "CC0-1.0",
     "BSL-1.0",
     "OpenSSL",
+    # webpki-roots ships the Mozilla CA bundle DATA under CDLA-Permissive-2.0
+    # (a permissive data license); pulled in transitively via reqwest/rustls.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
+# The workspace's own crates are unpublished and carry the repo Apache-2.0 license
+# (workspace.package.license) without restating it per-crate; ignore them rather
+# than have cargo-deny flag them "unlicensed".
+private = { ignore = true }
+# SCOPED exceptions — licenses NOT in the permissive allow-list above, accepted
+# only for the named crate so the gate still enforces every other dependency.
+exceptions = [
+    # wreq-util ships the TLS-fingerprint emulation tables for the OPTIONAL
+    # `stealth` feature and is LGPL-3.0 (weak copyleft). DECISION: stealth is
+    # build-from-source only — the official binaries (release + Docker) are built
+    # WITHOUT it and stay fully permissive, so this LGPL code is never distributed
+    # in a project artifact. This scoped exception only keeps the source-tree
+    # `--all-features` license check green; do NOT broaden it to a blanket
+    # LGPL-3.0 allow.
+    { crate = "wreq-util", allow = ["LGPL-3.0"] },
+]
 
 [sources]
 unknown-registry = "deny"

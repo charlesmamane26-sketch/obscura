@@ -154,6 +154,7 @@ pub async fn start_with_full_serve_options(
     // handles HTTP endpoints (/json/version, /json, /json/protocol) with
     // blocking I/O so they never contend with the LocalSet's V8 work.
     let accept_flag = shutdown_flag.clone();
+    let accept_bind_host = host.to_string();
     std::thread::Builder::new()
         .name("obscura-cdp-accept".into())
         .spawn(move || {
@@ -163,7 +164,7 @@ pub async fn start_with_full_serve_options(
                 }
                 match stream {
                     Ok(stream) => {
-                        if let Err(e) = accept_dispatch(stream, port, &ws_tx) {
+                        if let Err(e) = accept_dispatch(stream, port, &accept_bind_host, &ws_tx) {
                             if !format!("{}", e).contains("close") {
                                 error!("Accept dispatch error: {}", e);
                             }
@@ -246,6 +247,7 @@ const WS_PEEK_BUF: usize = 4;
 fn accept_dispatch(
     stream: std::net::TcpStream,
     port: u16,
+    bind_host: &str,
     ws_tx: &mpsc::Sender<std::net::TcpStream>,
 ) -> anyhow::Result<()> {
     let mut buf = [0u8; WS_PEEK_BUF];
@@ -267,7 +269,7 @@ fn accept_dispatch(
         };
 
         if let Some(ep) = endpoint {
-            return handle_http_json_blocking(stream, port, ep);
+            return handle_http_json_blocking(stream, port, bind_host, ep);
         }
         // Fall through: GET request that isn't a /json endpoint → treat as
         // WebSocket upgrade (Chromium DevTools clients issue GET with
@@ -295,12 +297,43 @@ fn accept_dispatch(
 fn handle_http_json_blocking(
     mut stream: std::net::TcpStream,
     port: u16,
+    bind_host: &str,
     endpoint: &str,
 ) -> anyhow::Result<()> {
     use std::io::{Read, Write};
 
     let mut buf = vec![0u8; 4096];
-    let _ = stream.read(&mut buf)?;
+    let n = stream.read(&mut buf)?;
+
+    // CDP-JSON-1: pin the Host like the WS handshake does. Without it, the HTTP
+    // control-plane endpoints answered any Host, so after a DNS rebind
+    // (evil.com -> 127.0.0.1) a page at evil.com:9222 could read /json/list
+    // same-origin to confirm obscura is running and read the target list. No
+    // Host header (a raw native client) is allowed, matching the WS path.
+    let host_header = String::from_utf8_lossy(&buf[..n])
+        .lines()
+        .find_map(|l| {
+            let l = l.trim_start();
+            if l.len() >= 5 && l[..5].eq_ignore_ascii_case("host:") {
+                Some(l[5..].trim().to_string())
+            } else {
+                None
+            }
+        });
+    if let Some(host) = host_header {
+        if !ws_host_is_safe(&host, bind_host) {
+            warn!("CDP /json request rejected: Host '{}' not allowed", host);
+            let body = "host not allowed";
+            let resp = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            );
+            stream.write_all(resp.as_bytes())?;
+            stream.flush()?;
+            return Ok(());
+        }
+    }
 
     let body = match endpoint {
         "version" => serde_json::to_string_pretty(&json!({

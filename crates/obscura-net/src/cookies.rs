@@ -97,6 +97,12 @@ impl CookieJar {
             return;
         }
 
+        // COOK-PREFIX-MISSING: enforce __Host-/__Secure- name-prefix integrity.
+        if !cookie_prefix_ok(&name, secure, url.scheme() == "https", !domain_explicit, &path) {
+            tracing::debug!("Rejected prefixed cookie '{}' (failed __Host-/__Secure- rules)", name);
+            return;
+        }
+
         if let Some(exp) = expires {
             if exp == 0 {
                 let mut cookies = self.cookies.write().unwrap();
@@ -129,7 +135,22 @@ impl CookieJar {
         cookies.entry(domain).or_default().insert(name, entry);
     }
 
+    /// Build the `Cookie` header for `url`, treating the request as same-site
+    /// (sends every host/path/secure-matching cookie regardless of `SameSite`).
+    /// This is the behaviour every caller had before COOK-04; cross-site
+    /// enforcement is available via [`get_cookie_header_ctx`](Self::get_cookie_header_ctx)
+    /// once the navigation stack threads the initiating site.
     pub fn get_cookie_header(&self, url: &Url) -> String {
+        self.get_cookie_header_ctx(url, SameSiteContext::SameSite)
+    }
+
+    /// Build the `Cookie` header for `url`, enforcing each cookie's `SameSite`
+    /// attribute against the request's same-site context (COOK-04). Pass
+    /// [`SameSiteContext::CrossSiteTopLevel`] / [`SameSiteContext::CrossSite`]
+    /// from the navigation/redirect path (with the initiating top-level site) to
+    /// withhold `Strict`/`Lax` cookies on cross-site requests and restore CSRF
+    /// protection; [`SameSiteContext::SameSite`] keeps the legacy "send all".
+    pub fn get_cookie_header_ctx(&self, url: &Url, ctx: SameSiteContext) -> String {
         let host = url.host_str().unwrap_or("");
         let path = url.path();
         let is_secure = url.scheme() == "https";
@@ -155,7 +176,12 @@ impl CookieJar {
                 if entry.secure && !is_secure {
                     continue;
                 }
-                if !path.starts_with(&entry.path) {
+                if !path_matches(path, &entry.path) {
+                    continue;
+                }
+                // COOK-04: drop Strict on any cross-site request and Lax on
+                // cross-site subresource / unsafe-method requests.
+                if !same_site_allows(&entry.same_site, ctx) {
                     continue;
                 }
                 matching.push(format!("{}={}", entry.name, entry.value));
@@ -188,6 +214,32 @@ impl CookieJar {
     pub fn set_cookies_from_cdp(&self, cookies: Vec<CookieInfo>) {
         let mut jar = self.cookies.write().unwrap();
         for cookie in cookies {
+            // COOK-CDP-INJECT-1 / COOK-03: the programmatic ingestion path (CDP
+            // Network.setCookie / Storage.setCookies / MCP browser_set_cookie) is
+            // reachable by an unauthenticated A2 client and previously stored the
+            // domain verbatim — letting `Domain=com` become a supercookie. Reject
+            // public-suffix and bare-TLD domains here just like the Set-Cookie /
+            // document.cookie paths do via is_cookie_domain_allowed.
+            if cookie.domain.trim_start_matches('.').is_empty() || is_public_suffix(&cookie.domain) {
+                tracing::debug!(
+                    "Rejected CDP/MCP cookie '{}' for public-suffix/empty Domain={}",
+                    cookie.name,
+                    cookie.domain
+                );
+                continue;
+            }
+            // COOK-PREFIX-MISSING: a __Host-/__Secure- cookie injected via CDP/MCP
+            // must satisfy the prefix integrity rules too. Transport is not modeled
+            // here, so the cookie's own Secure flag governs; host-only is best-effort
+            // (a leading-dot domain is explicitly subdomain-spanning).
+            let host_only = !cookie.domain.starts_with('.');
+            if !cookie_prefix_ok(&cookie.name, cookie.secure, true, host_only, &cookie.path) {
+                tracing::debug!(
+                    "Rejected CDP/MCP prefixed cookie '{}' (failed __Host-/__Secure- rules)",
+                    cookie.name
+                );
+                continue;
+            }
             let same_site = if cookie.same_site.is_empty() {
                 DEFAULT_SAME_SITE.to_string()
             } else {
@@ -237,7 +289,7 @@ impl CookieJar {
                 if entry.secure && !is_secure {
                     continue;
                 }
-                if !path.starts_with(&entry.path) {
+                if !path_matches(path, &entry.path) {
                     continue;
                 }
                 matching.push(format!("{}={}", entry.name, entry.value));
@@ -311,6 +363,12 @@ impl CookieJar {
         // host is not under, or that is a public suffix.
         if domain_explicit && !is_cookie_domain_allowed(url.host_str().unwrap_or(""), &domain) {
             tracing::debug!("Rejected cross-scope JS cookie '{}' for Domain={}", name, domain);
+            return;
+        }
+
+        // COOK-PREFIX-MISSING: page JS must not forge a __Host-/__Secure- cookie.
+        if !cookie_prefix_ok(&name, secure, url.scheme() == "https", !domain_explicit, &path) {
+            tracing::debug!("Rejected prefixed JS cookie '{}' (failed __Host-/__Secure- rules)", name);
             return;
         }
 
@@ -445,6 +503,24 @@ impl CookieJar {
             let _ = std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o600));
         }
         tmp.persist(path).map_err(|e| e.error)?;
+        // COOK-06-WINDOWS-PERMS: Windows has no mode bits, so the unix branch
+        // above is a no-op there and the persisted jar inherits the parent
+        // directory ACL — exposing cleartext session cookies to other local users
+        // when --storage-dir is outside the user profile. Best-effort: drop
+        // inherited ACEs and grant only the current user, via icacls.
+        #[cfg(windows)]
+        {
+            if let Ok(user) = std::env::var("USERNAME") {
+                if !user.is_empty() {
+                    let _ = std::process::Command::new("icacls")
+                        .arg(path)
+                        .arg("/inheritance:r")
+                        .arg("/grant:r")
+                        .arg(format!("{}:F", user))
+                        .output();
+                }
+            }
+        }
         Ok(())
     }
 
@@ -537,24 +613,136 @@ fn host_is_under_domain(host: &str, domain: &str) -> bool {
 /// Best-effort public-suffix test. A `Domain=` equal to a public suffix would
 /// scope the cookie to EVERY site under it. A full PSL (the `publicsuffix`
 /// crate) is the complete answer; this built-in covers bare TLDs plus the most
-/// common multi-label suffixes without adding a dependency.
+/// common ICANN multi-label suffixes and the cloud-hosting *private* suffixes
+/// that are routinely abused for cross-tenant cookie injection, without adding a
+/// dependency (COOK-PSL-HARDCODED-GAPS — expanded coverage).
 fn is_public_suffix(domain: &str) -> bool {
+    let domain = domain.trim_start_matches('.');
     if !domain.contains('.') {
         return true; // bare TLD / single label: com, localhost, internal, …
     }
     const COMMON: &[&str] = &[
+        // United Kingdom
         "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk", "net.uk", "sch.uk", "ltd.uk", "plc.uk",
+        // Australia / New Zealand
         "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au",
         "co.nz", "org.nz", "net.nz", "govt.nz", "ac.nz",
+        // Japan
         "co.jp", "or.jp", "ne.jp", "ac.jp", "go.jp", "ad.jp", "ed.jp", "gr.jp",
+        // China / Hong Kong / Taiwan / Singapore / Malaysia / Philippines
         "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn",
+        "com.hk", "com.tw", "com.sg", "com.my", "com.ph",
+        // Americas
         "com.br", "net.br", "org.br", "gov.br",
-        "com.mx", "com.ar", "com.co", "com.tr", "com.tw", "com.hk", "com.sg", "com.my", "com.ph",
-        "co.in", "net.in", "org.in", "co.za", "co.kr", "co.il", "co.id", "co.th",
+        "com.mx", "com.ar", "com.co", "com.ve", "com.pe", "com.uy",
+        // Europe / Middle East / Africa / India / Korea / others
+        "com.tr", "com.ua", "com.ng", "com.pk", "com.eg",
+        "co.in", "net.in", "org.in", "gov.in", "ac.in",
+        "co.za", "co.kr", "or.kr", "ne.kr", "co.il", "co.id", "co.th", "co.ke", "co.ve",
+        "eu.org",
+        // Hosting / CDN PRIVATE suffixes (PSL "PRIVATE" section) — each tenant is
+        // a distinct registrable site, so a Domain= scoped to the suffix itself
+        // is a cross-tenant supercookie.
         "github.io", "gitlab.io", "herokuapp.com", "appspot.com", "web.app", "firebaseapp.com",
-        "pages.dev", "workers.dev", "vercel.app", "netlify.app",
+        "cloudfunctions.net", "pages.dev", "workers.dev", "r2.dev", "vercel.app", "netlify.app",
+        "azurewebsites.net", "azurestaticapps.net", "cloudfront.net", "fastly.net",
+        "amazonaws.com", "s3.amazonaws.com", "elasticbeanstalk.com", "sevalla.app",
+        "ondigitalocean.app", "render.com", "fly.dev",
     ];
     COMMON.iter().any(|s| domain.eq_ignore_ascii_case(s))
+}
+
+/// Same-site context of an egress request, used to enforce a cookie's `SameSite`
+/// attribute at send time (COOK-04). The jar stores `same_site` but the request
+/// pipeline must tell it whether the request is same-site relative to the
+/// initiating (top-level) document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SameSiteContext {
+    /// Same-site request (or initiator unknown): all cookies allowed. This is the
+    /// default and preserves the pre-COOK-04 behaviour for callers that do not yet
+    /// thread the initiator.
+    SameSite,
+    /// Cross-site **top-level navigation** with a safe method (GET/HEAD): `Lax`
+    /// and `None` cookies are sent, `Strict` is withheld.
+    CrossSiteTopLevel,
+    /// Cross-site subresource load or unsafe-method request: only `None` is sent.
+    CrossSite,
+}
+
+/// COOK-04 egress decision: may a cookie with stored `same_site` be attached to a
+/// request in `ctx`? `Lax` is the default when the attribute is absent/unknown.
+fn same_site_allows(same_site: &str, ctx: SameSiteContext) -> bool {
+    let ss = same_site.trim();
+    let is_strict = ss.eq_ignore_ascii_case("Strict");
+    let is_none = ss.eq_ignore_ascii_case("None");
+    match ctx {
+        SameSiteContext::SameSite => true,
+        SameSiteContext::CrossSiteTopLevel => !is_strict, // Lax + None
+        SameSiteContext::CrossSite => is_none,            // None only
+    }
+}
+
+/// Registrable domain (eTLD+1) of a host, used for the same-site comparison.
+/// `www.example.com` and `api.example.com` -> `example.com`; for a host directly
+/// under a multi-label / private public suffix (`a.azurewebsites.net`) the host
+/// itself is the registrable domain, so two tenants are correctly *not* same-site.
+fn registrable_domain(host: &str) -> String {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() || host.parse::<std::net::IpAddr>().is_ok() {
+        return host; // IP literal (or empty): the literal is its own site
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    for i in 0..labels.len() {
+        if is_public_suffix(&labels[i..].join(".")) {
+            // eTLD+1 = the public suffix plus one more label to its left.
+            return labels[i.saturating_sub(1)..].join(".");
+        }
+    }
+    host
+}
+
+/// True if two URLs are "same-site" — same registrable domain (eTLD+1) — for
+/// SameSite cookie enforcement (COOK-04). Scheme/port are irrelevant to
+/// same-site (unlike same-origin). A missing host on either side is not
+/// same-site (fail-safe).
+pub fn is_same_site(a: &Url, b: &Url) -> bool {
+    match (a.host_str(), b.host_str()) {
+        (Some(ha), Some(hb)) => registrable_domain(ha) == registrable_domain(hb),
+        _ => false,
+    }
+}
+
+/// RFC 6265 §5.1.4 path-match. The previous `request_path.starts_with(cookie_path)`
+/// leaked a cookie scoped to `Path=/admin` onto `/administrator` / `/admin-x`
+/// (COOK-PATH-BOUND-1). A match requires an exact equality, a cookie-path that
+/// ends in `/`, or a `/` at the request-path char immediately after the prefix.
+fn path_matches(request_path: &str, cookie_path: &str) -> bool {
+    if request_path == cookie_path {
+        return true;
+    }
+    if !request_path.starts_with(cookie_path) {
+        return false;
+    }
+    cookie_path.ends_with('/') || request_path.as_bytes().get(cookie_path.len()) == Some(&b'/')
+}
+
+/// RFC 6265bis cookie name-prefix rules (COOK-PREFIX-MISSING). A real browser
+/// rejects a `__Secure-`/`__Host-` cookie that does not meet the prefix's
+/// integrity requirements; obscura must too, or a network/MITM response (A1) or
+/// an unauthenticated CDP/MCP client (A2) could forge or overwrite a cookie the
+/// site pinned with a prefix (session fixation). Prefixes are matched
+/// case-insensitively.
+/// - `__Secure-`: the cookie must be `Secure` and set over a secure transport.
+/// - `__Host-`: the above, plus host-only (no explicit `Domain=`) and `Path=/`.
+fn cookie_prefix_ok(name: &str, secure: bool, secure_transport: bool, host_only: bool, path: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with("__host-") {
+        return secure && secure_transport && host_only && path == "/";
+    }
+    if lower.starts_with("__secure-") {
+        return secure && secure_transport;
+    }
+    true
 }
 
 /// Validate an explicit `Domain=` attribute against the request host (audit
@@ -862,7 +1050,6 @@ mod tests {
     #[test]
     fn test_cookie_from_file_load_then_send_in_request() {
         // Simulate what happens: load cookies from file → navigate → cookie should be in request
-        use std::io::Write;
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("cookies.json");
         
@@ -928,5 +1115,142 @@ mod tests {
         let local = Url::parse("http://localhost:3000/").unwrap();
         jar.set_cookie_from_js("h=2", &local);
         assert!(jar.get_cookie_header(&local).contains("h=2"));
+    }
+
+    // ── COOK-CDP-INJECT-1 / COOK-03: programmatic ingestion scope ────────────
+
+    fn cdp_cookie(name: &str, domain: &str, path: &str, secure: bool) -> CookieInfo {
+        CookieInfo {
+            name: name.to_string(),
+            value: "x".to_string(),
+            domain: domain.to_string(),
+            path: path.to_string(),
+            secure,
+            http_only: false,
+            same_site: String::new(),
+            expires: None,
+        }
+    }
+
+    #[test]
+    fn cdp_ingestion_rejects_public_suffix_and_bare_tld() {
+        let jar = CookieJar::new();
+        for dom in ["com", "co.uk", "azurewebsites.net", ".com"] {
+            jar.set_cookies_from_cdp(vec![cdp_cookie("track", dom, "/", false)]);
+        }
+        assert!(
+            jar.get_all_cookies().is_empty(),
+            "public-suffix / bare-TLD CDP cookies must be dropped, got {:?}",
+            jar.get_all_cookies()
+        );
+        // A registrable domain is still accepted.
+        jar.set_cookies_from_cdp(vec![cdp_cookie("ok", "example.com", "/", false)]);
+        assert_eq!(jar.get_all_cookies().len(), 1);
+    }
+
+    #[test]
+    fn cdp_ingestion_enforces_cookie_prefixes() {
+        let jar = CookieJar::new();
+        // __Host-/__Secure- without the Secure flag are rejected.
+        jar.set_cookies_from_cdp(vec![cdp_cookie("__Host-sid", "example.com", "/", false)]);
+        jar.set_cookies_from_cdp(vec![cdp_cookie("__Secure-sid", "example.com", "/", false)]);
+        // __Host- with a non-root path is rejected.
+        jar.set_cookies_from_cdp(vec![cdp_cookie("__Host-sid", "example.com", "/admin", true)]);
+        assert!(jar.get_all_cookies().is_empty(), "got {:?}", jar.get_all_cookies());
+        // Valid __Host- (Secure, host-only, Path=/) is kept.
+        jar.set_cookies_from_cdp(vec![cdp_cookie("__Host-sid", "example.com", "/", true)]);
+        assert_eq!(jar.get_all_cookies().len(), 1);
+    }
+
+    // ── COOK-PREFIX-MISSING: header / document.cookie paths ──────────────────
+
+    #[test]
+    fn set_cookie_enforces_prefixes() {
+        let jar = CookieJar::new();
+        let https = Url::parse("https://example.com/").unwrap();
+        let http = Url::parse("http://example.com/").unwrap();
+        jar.set_cookie("__Secure-a=1", &https); // missing Secure flag
+        jar.set_cookie("__Secure-b=1; Secure", &http); // not a secure transport
+        jar.set_cookie("__Host-c=1; Secure; Domain=example.com; Path=/", &https); // not host-only
+        jar.set_cookie("__Host-d=1; Secure; Path=/admin", &https); // path != /
+        assert!(
+            jar.get_all_cookies().is_empty(),
+            "invalid prefixed cookies must be dropped, got {:?}",
+            jar.get_all_cookies()
+        );
+        jar.set_cookie("__Secure-e=1; Secure", &https);
+        jar.set_cookie("__Host-f=1; Secure; Path=/", &https);
+        assert_eq!(jar.get_all_cookies().len(), 2);
+    }
+
+    #[test]
+    fn set_cookie_rejects_private_cloud_suffix() {
+        // COOK-PSL-HARDCODED-GAPS: a cloud PRIVATE suffix must be rejected so one
+        // tenant cannot scope a cookie across every other tenant.
+        let jar = CookieJar::new();
+        jar.set_cookie_from_js(
+            "shared=evil; Domain=azurewebsites.net",
+            &Url::parse("https://evil.azurewebsites.net/").unwrap(),
+        );
+        assert!(jar.get_all_cookies().is_empty());
+    }
+
+    // ── COOK-PATH-BOUND-1: RFC 6265 §5.1.4 path-match boundary ───────────────
+
+    #[test]
+    fn cookie_path_match_respects_directory_boundary() {
+        let jar = CookieJar::new();
+        jar.set_cookie("sid=1; Path=/admin", &Url::parse("https://example.com/admin").unwrap());
+        let leak = jar.get_cookie_header(&Url::parse("https://example.com/administrator").unwrap());
+        assert!(!leak.contains("sid=1"), "Path=/admin must not leak to /administrator, got '{}'", leak);
+        assert!(jar
+            .get_cookie_header(&Url::parse("https://example.com/admin").unwrap())
+            .contains("sid=1"));
+        assert!(jar
+            .get_cookie_header(&Url::parse("https://example.com/admin/users").unwrap())
+            .contains("sid=1"));
+    }
+
+    // ── COOK-04: SameSite enforced at egress ─────────────────────────────────
+
+    #[test]
+    fn cook04_samesite_enforced_at_egress() {
+        let jar = CookieJar::new();
+        let url = Url::parse("https://example.com/").unwrap();
+        jar.set_cookie("strict=s; SameSite=Strict; Secure", &url);
+        jar.set_cookie("lax=l; SameSite=Lax; Secure", &url);
+        jar.set_cookie("nonec=n; SameSite=None; Secure", &url);
+
+        // Default / same-site: every cookie is sent (legacy behaviour preserved).
+        let same = jar.get_cookie_header(&url);
+        assert!(same.contains("strict=s") && same.contains("lax=l") && same.contains("nonec=n"));
+
+        // Cross-site top-level navigation: Strict withheld, Lax + None sent.
+        let top = jar.get_cookie_header_ctx(&url, SameSiteContext::CrossSiteTopLevel);
+        assert!(!top.contains("strict=s"), "Strict must be withheld cross-site, got '{}'", top);
+        assert!(top.contains("lax=l") && top.contains("nonec=n"));
+
+        // Cross-site subresource / unsafe method: only None is sent.
+        let cross = jar.get_cookie_header_ctx(&url, SameSiteContext::CrossSite);
+        assert!(!cross.contains("strict=s") && !cross.contains("lax=l"), "got '{}'", cross);
+        assert!(cross.contains("nonec=n"));
+    }
+
+    #[test]
+    fn same_site_registrable_domain_comparison() {
+        let u = |s: &str| Url::parse(s).unwrap();
+        // Same registrable domain across subdomains / scheme / port.
+        assert!(is_same_site(&u("https://www.example.com/"), &u("https://api.example.com/")));
+        assert!(is_same_site(&u("http://example.com:80/"), &u("https://example.com/")));
+        // Different registrable domains.
+        assert!(!is_same_site(&u("https://bank.com/"), &u("https://evil.com/")));
+        // Cross-tenant under a PRIVATE public suffix is NOT same-site.
+        assert!(!is_same_site(
+            &u("https://a.azurewebsites.net/"),
+            &u("https://b.azurewebsites.net/")
+        ));
+        // Same tenant under a multi-label suffix IS same-site.
+        assert!(is_same_site(&u("https://x.shop.co.uk/"), &u("https://y.shop.co.uk/")));
+        assert!(!is_same_site(&u("https://shop.co.uk/"), &u("https://other.co.uk/")));
     }
 }

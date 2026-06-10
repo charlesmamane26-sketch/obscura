@@ -1,0 +1,21 @@
+version: 2
+updates:
+  # ACTIONS-UNPINNED-N1: every action is pinned to a full commit SHA (with a
+  # `# vX` comment) instead of a mutable tag/branch. Dependabot bumps the SHA +
+  # the version comment together so the pins stay current without going stale.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "security"
+
+  # Keep the Cargo dependency tree current (advisories are gated by cargo-deny).
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"

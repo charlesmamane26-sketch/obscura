@@ -21,7 +21,11 @@ scraped site as adversarial. The trust boundaries that matter:
 - Do **not** expose the CDP/MCP port beyond `127.0.0.1` on untrusted networks
   (avoid `--host 0.0.0.0` outside a controlled setup).
 - Leave `--allow-file-access` **off** (the default) unless serving local HTML on
-  a trusted network.
+  a trusted network. When you do enable it, set `OBSCURA_FILE_ACCESS_ROOT` to the
+  directory you intend to serve — `file://` reads are then confined to that root
+  (canonicalized, with `..`/symlink escapes and Windows UNC paths rejected).
+  Without it the gate is all-or-nothing and grants read of the whole filesystem
+  the process can see.
 - Do **not** set `OBSCURA_ALLOW_PRIVATE_NETWORK` / `--allow-private-network` in
   production; it disables the SSRF guard.
 - A web page in the victim's browser cannot drive the CDP/MCP HTTP port

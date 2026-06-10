@@ -48,10 +48,11 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Install cross-compilation toolchain (aarch64-linux)
@@ -70,9 +71,12 @@ jobs:
         # Cargo.lock, never a silently-newer dependency set (SUPPLY-02).
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Build stealth
-        run: cargo build --release --locked --target ${{ matrix.target }} --features stealth
-        continue-on-error: true
+      # Stealth (--features stealth) is intentionally NOT built or shipped here:
+      # it pulls wreq-util (LGPL-3.0), and distributing a statically-linked stealth
+      # binary would carry LGPL relinking obligations. Official binaries stay fully
+      # permissive (Apache-2.0 + permissive deps); stealth is build-from-source
+      # (`cargo build --features stealth`), where no distribution obligation applies.
+      # Stealth still compiles+tests in ci.yml's dedicated job.
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -102,7 +106,7 @@ jobs:
           "$h  ${{ matrix.name }}.zip" | Out-File -Encoding ascii ${{ matrix.name }}.zip.sha256
 
       - name: Upload
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             ${{ matrix.name }}.tar.gz

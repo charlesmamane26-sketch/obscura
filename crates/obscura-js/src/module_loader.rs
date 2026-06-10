@@ -107,9 +107,20 @@ impl ModuleLoader for ObscuraModuleLoader {
                 )));
             }
 
-            let code = resp.text().await.map_err(|e| {
-                io_err(format!("Failed to read module body {}: {}", url, e))
-            })?;
+            // DOS-N1: a dynamic `import()` is a page-reachable egress, so bound
+            // the body the same way op_fetch_url / the nav client do. `resp.text()`
+            // buffered the whole (possibly endless or decompression-bombed) body
+            // into a String with no cap — a single `import('https://evil/huge.mjs')`
+            // could OOM-kill the host. read_body_capped truncates at
+            // OBSCURA_MAX_BODY_BYTES (256 MiB default), bounding the decompressed
+            // size since reqwest decompresses transparently.
+            let body_bytes =
+                obscura_net::read_body_capped(resp, obscura_net::max_response_body())
+                    .await
+                    .map_err(|e| {
+                        io_err(format!("Failed to read module body {}: {}", url, e))
+                    })?;
+            let code = String::from_utf8_lossy(&body_bytes).into_owned();
 
             let specifier = ModuleSpecifier::parse(&url)
                 .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
