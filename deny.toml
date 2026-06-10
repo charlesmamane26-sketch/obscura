@@ -1,5 +1,11 @@
 # cargo-deny configuration — https://embarkstudios.github.io/cargo-deny/
-# Run: cargo deny check advisories bans sources
+# CI runs: cargo deny check advisories bans sources licenses (with --all-features)
+
+[graph]
+# Evaluate the FULL feature graph — including the optional `stealth` feature, which
+# pulls the wreq / BoringSSL tree — so the checks below match CI's --all-features
+# run and a license/advisory in an optional feature can't slip past a local check.
+all-features = true
 
 [advisories]
 # Real vulnerabilities fail the build. The advisories below are *unmaintained*
@@ -44,6 +50,17 @@ confidence-threshold = 0.8
 # (workspace.package.license) without restating it per-crate; ignore them rather
 # than have cargo-deny flag them "unlicensed".
 private = { ignore = true }
+# SCOPED exceptions — licenses NOT in the permissive allow-list above, accepted
+# only for the named crate so the gate still enforces every other dependency.
+exceptions = [
+    # wreq-util ships the TLS-fingerprint emulation tables for the OPTIONAL
+    # `stealth` feature and is LGPL-3.0 (weak copyleft). It is absent from the
+    # default build. ⚠ REVIEW: shipping a statically-linked `--features stealth`
+    # binary carries LGPL-3.0 relinking obligations; the default binary is
+    # unaffected. Accepted here so the licenses gate stays green while the policy
+    # decision is made — do NOT broaden this to a blanket LGPL-3.0 allow.
+    { crate = "wreq-util", allow = ["LGPL-3.0"] },
+]
 
 [sources]
 unknown-registry = "deny"
