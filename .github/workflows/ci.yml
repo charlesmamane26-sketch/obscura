@@ -17,11 +17,12 @@ jobs:
     name: Test & Clippy
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       # Informational for now (the tree has pre-existing style lints); tighten
       # to `-- -D warnings` once they are cleared with `cargo clippy --fix`.
       - name: Clippy
@@ -37,9 +38,11 @@ jobs:
     name: Build & test (stealth / wreq)
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       # boring-sys (BoringSSL) runs bindgen, which needs libclang. Without it the
       # `--features stealth` build fails — which is why this path was previously
       # untested (the maintainers' Windows hosts lack libclang). Run it on Linux
@@ -56,8 +59,8 @@ jobs:
     name: Audit & Deny
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
         with:
           # DENY-NO-LICENSES-N4: also enforce the deny.toml [licenses] allow-list
           # so a transitive dep under a copyleft / unknown license is caught.
@@ -69,7 +72,7 @@ jobs:
     container:
       image: semgrep/semgrep
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           # Full history so the diff-aware baseline scan below can reach the PR
           # base commit.
