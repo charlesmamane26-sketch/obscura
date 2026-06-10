@@ -523,8 +523,16 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
         .pool_idle_timeout(std::time::Duration::from_secs(300))
         .tcp_keepalive(std::time::Duration::from_secs(60));
     if let Some(proxy) = proxy_url {
-        let p = reqwest::Proxy::all(proxy)
-            .map_err(|e| format!("Invalid op_fetch_url proxy '{}': {}", proxy, e))?;
+        // OPS-04-N1: never interpolate the raw proxy URL — its userinfo (creds)
+        // would reach the page-JS realm via the returned JsErrorBox and any log.
+        // reqwest's parse error does not echo the URL, so keep it for diagnostics.
+        let p = reqwest::Proxy::all(proxy).map_err(|e| {
+            format!(
+                "Invalid op_fetch_url proxy '{}': {}",
+                obscura_net::redact_proxy(proxy),
+                e
+            )
+        })?;
         builder = builder.proxy(p);
     }
     builder
@@ -865,19 +873,32 @@ async fn op_fetch_url(
     let resp_bytes = obscura_net::read_body_capped(response, obscura_net::max_response_body())
         .await
         .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
-    let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
+
+    // DOS-OPS-AMP-1: the JS shim needs both a text and a base64 view, but holding
+    // the raw bytes + text + base64 + a freshly serialized JSON copy all at once
+    // turned a capped 256 MiB body into a ~1.1 GB peak (and N concurrent fetches
+    // multiply it). Derive both views, free the raw bytes before serializing, and
+    // MOVE the strings into the JSON value (`serde_json::json!` would clone them).
     let resp_body_base64 = BASE64.encode(&resp_bytes);
+    let resp_body = String::from_utf8_lossy(&resp_bytes).into_owned();
+    drop(resp_bytes);
 
     tracing::debug!("op_fetch_url completed: {} {} ({} bytes)", method, url, resp_body.len());
 
-    Ok(serde_json::json!({
-        "status": status,
-        "body": resp_body,
-        "bodyBase64": resp_body_base64,
-        "url": url,
-        "headers": resp_headers,
-    })
-    .to_string())
+    let mut payload = serde_json::Map::new();
+    payload.insert("status".to_string(), serde_json::Value::from(status));
+    payload.insert("body".to_string(), serde_json::Value::String(resp_body));
+    payload.insert(
+        "bodyBase64".to_string(),
+        serde_json::Value::String(resp_body_base64),
+    );
+    payload.insert("url".to_string(), serde_json::Value::String(url));
+    payload.insert(
+        "headers".to_string(),
+        serde_json::to_value(resp_headers)
+            .unwrap_or_else(|_| serde_json::Value::Object(Default::default())),
+    );
+    Ok(serde_json::Value::Object(payload).to_string())
 }
 
 fn glob_match(pattern: &str, url: &str) -> bool {
