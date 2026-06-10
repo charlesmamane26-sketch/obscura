@@ -89,6 +89,55 @@ pub fn env_allows_private_network() -> bool {
     )
 }
 
+/// Strip any userinfo (credentials) from a proxy URL before it is logged or
+/// surfaced in an error: `socks5://user:pass@host:1080` -> `socks5://***@host:1080`.
+/// Proxy credentials must never reach logs or the page-JS realm (OPS-04 /
+/// OPS-04-N1). Splits on the LAST `@` before the host so a password containing
+/// an `@` cannot leak a fragment (OPS-04-N2). Shared by every proxy-touching
+/// site (CLI, op_fetch_url, module loader) so the redaction can't drift.
+pub fn redact_proxy(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let after = &url[scheme_end + 3..];
+        if let Some(at) = after.rfind('@') {
+            return format!("{}://***@{}", &url[..scheme_end], &after[at + 1..]);
+        }
+    }
+    url.to_string()
+}
+
+/// Forbidden request-header names a caller must not be able to set on an egress
+/// request: Host/Cookie/Referer/Origin and the Fetch-spec forbidden set, plus
+/// every `sec-*` / `proxy-*` / `access-control-request-*` name. Mirrors the
+/// op_fetch_url filter (OPS-HDR-01) so the CDP navigation path
+/// (`Network.setExtraHTTPHeaders`) cannot inject them either (HDR-NAV-FILTER-N5).
+/// Case-insensitive. `user-agent` / `content-type` are intentionally allowed.
+pub fn is_forbidden_request_header(name: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    matches!(
+        n.as_str(),
+        "host"
+            | "cookie"
+            | "cookie2"
+            | "referer"
+            | "origin"
+            | "connection"
+            | "keep-alive"
+            | "content-length"
+            | "transfer-encoding"
+            | "te"
+            | "trailer"
+            | "upgrade"
+            | "via"
+            | "expect"
+            | "date"
+            | "accept-charset"
+            | "accept-encoding"
+            | "dnt"
+    ) || n.starts_with("sec-")
+        || n.starts_with("proxy-")
+        || n.starts_with("access-control-request-")
+}
+
 /// Returns true if `ip` is a forbidden SSRF target: loopback, private, internal,
 /// or otherwise non-publicly-routable. Canonicalizes IPv4-mapped and NAT64 IPv6
 /// addresses to their embedded IPv4 and re-checks, so `::ffff:127.0.0.1` and
@@ -114,6 +163,34 @@ pub fn is_forbidden_ip(ip: &IpAddr) -> bool {
                     (s[6] & 0xff) as u8,
                     (s[7] >> 8) as u8,
                     (s[7] & 0xff) as u8,
+                );
+                return is_forbidden_ipv4(&v4);
+            }
+            // IPv4-compatible `::a.b.c.d` (first 96 bits zero) smuggles an
+            // internal v4 the same way the mapped form does, e.g.
+            // `::169.254.169.254` or `::127.0.0.1`. Deprecated per RFC 4291 but
+            // still parseable, and `to_ipv4_mapped()` returns None for it, so the
+            // v6 fallback would wave it through (SSRF-N1). Re-check the embedded
+            // v4. `::` and `::1` also land here and map to 0.0.0.0 / 0.0.0.1,
+            // both already forbidden by is_forbidden_ipv4.
+            if s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
+                let v4 = Ipv4Addr::new(
+                    (s[6] >> 8) as u8,
+                    (s[6] & 0xff) as u8,
+                    (s[7] >> 8) as u8,
+                    (s[7] & 0xff) as u8,
+                );
+                return is_forbidden_ipv4(&v4);
+            }
+            // 6to4 `2002:AABB:CCDD::/16` embeds the target v4 in segments[1..=2]
+            // (e.g. `2002:7f00:1::` == 127.0.0.1, `2002:a9fe:a9fe::` ==
+            // 169.254.169.254). Re-check that v4 (SSRF-N1).
+            if s[0] == 0x2002 {
+                let v4 = Ipv4Addr::new(
+                    (s[1] >> 8) as u8,
+                    (s[1] & 0xff) as u8,
+                    (s[2] >> 8) as u8,
+                    (s[2] & 0xff) as u8,
                 );
                 return is_forbidden_ipv4(&v4);
             }
@@ -290,10 +367,59 @@ pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(),
     Ok(())
 }
 
+/// Optional root directory that confines `file://` reads (FILE-GATE-05). Set via
+/// `OBSCURA_FILE_ACCESS_ROOT`. The `--allow-file-access` gate is otherwise
+/// all-or-nothing: enabling it to serve one local HTML directory grants read of
+/// the entire filesystem the process can see. When this is set, reads are scoped
+/// to the directory. Unset preserves the prior (unrestricted) operator flow.
+fn file_access_root() -> Option<std::path::PathBuf> {
+    std::env::var_os("OBSCURA_FILE_ACCESS_ROOT")
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// Confine `path` to `root` (FILE-GATE-05): canonicalize both (which resolves
+/// `..` traversal and symlink escapes) and require the target to live under the
+/// root; reject UNC paths on Windows. Fail-closed: a path that cannot be
+/// canonicalized (e.g. does not exist) is rejected.
+fn enforce_file_root(
+    path: &std::path::Path,
+    root: &std::path::Path,
+) -> Result<(), ObscuraNetError> {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let is_unc = path.components().any(|c| {
+            matches!(c, Component::Prefix(p)
+                if matches!(p.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..)))
+        });
+        if is_unc {
+            return Err(ObscuraNetError::Network(
+                "file:// UNC paths are not allowed".to_string(),
+            ));
+        }
+    }
+    let canon_root = std::fs::canonicalize(root).map_err(|e| {
+        ObscuraNetError::Network(format!("file access root is invalid: {}", e))
+    })?;
+    let canon_path = std::fs::canonicalize(path)
+        .map_err(|e| ObscuraNetError::Network(format!("Failed to resolve file path: {}", e)))?;
+    if !canon_path.starts_with(&canon_root) {
+        return Err(ObscuraNetError::Network(
+            "file:// access denied: path is outside the allowed root".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 async fn fetch_file_url(url: &Url) -> Result<Response, ObscuraNetError> {
     let path = url
         .to_file_path()
         .map_err(|_| ObscuraNetError::Network("Invalid file URL".to_string()))?;
+    // FILE-GATE-05: confine reads to OBSCURA_FILE_ACCESS_ROOT when configured.
+    if let Some(root) = file_access_root() {
+        enforce_file_root(&path, &root)?;
+    }
     let body = tokio::fs::read(&path)
         .await
         .map_err(|e| ObscuraNetError::Network(format!("Failed to read file: {}", e)))?;
@@ -558,6 +684,13 @@ impl ObscuraHttpClient {
             }
 
             for (k, v) in self.extra_headers.read().await.iter() {
+                // HDR-NAV-FILTER-N5: a CDP client's Network.setExtraHTTPHeaders
+                // must not be able to inject Host/Cookie/Referer/Origin/Sec-*
+                // onto the navigation egress (vhost confusion, cookie-jar
+                // override), matching the op_fetch_url filter on the JS path.
+                if is_forbidden_request_header(k) {
+                    continue;
+                }
                 if let (Ok(name), Ok(val)) = (
                     HeaderName::from_bytes(k.as_bytes()),
                     HeaderValue::from_str(v),
@@ -779,6 +912,44 @@ mod ssrf_guard_tests {
         }
     }
 
+    // SSRF-N1: an internal IPv4 smuggled inside an IPv6 literal via the
+    // IPv4-compatible (`::a.b.c.d`) or 6to4 (`2002::/16`) encoding must be caught;
+    // the prior denylist only canonicalized the mapped (`::ffff:`) and NAT64
+    // forms, so `::ffff:127.0.0.1` was blocked but `::127.0.0.1` was not.
+    #[test]
+    fn rejects_ipv4_compatible_and_6to4_internal() {
+        use std::net::{IpAddr, Ipv6Addr};
+        let forbidden: &[&str] = &[
+            "::127.0.0.1",       // IPv4-compatible loopback
+            "::169.254.169.254", // IPv4-compatible cloud metadata
+            "::10.0.0.1",        // IPv4-compatible RFC1918
+            "2002:7f00:1::",     // 6to4 -> 127.0.0.1
+            "2002:a9fe:a9fe::",  // 6to4 -> 169.254.169.254
+            "2002:a00:1::",      // 6to4 -> 10.0.0.1
+        ];
+        for raw in forbidden {
+            let ip = IpAddr::V6(raw.parse::<Ipv6Addr>().unwrap());
+            assert!(is_forbidden_ip(&ip), "{raw} must be forbidden (SSRF-N1)");
+        }
+        // The same encodings embedding a PUBLIC v4 must stay allowed.
+        let allowed: &[&str] = &[
+            "2002:5db8:d822::", // 6to4 -> 93.184.216.34 (public)
+            "::93.184.216.34",  // IPv4-compatible public
+        ];
+        for raw in allowed {
+            let ip = IpAddr::V6(raw.parse::<Ipv6Addr>().unwrap());
+            assert!(!is_forbidden_ip(&ip), "{raw} should be allowed");
+        }
+        // And through the URL-string guard (initial URL + every redirect hop).
+        for raw in [
+            "http://[::169.254.169.254]/",
+            "http://[2002:7f00:1::]/",
+            "http://[2002:a9fe:a9fe::]/",
+        ] {
+            assert!(check(raw, false).is_err(), "{raw} must be rejected (SSRF-N1)");
+        }
+    }
+
     // Resolve-time guard: a hostname that resolves to a forbidden address must
     // be rejected at connect time, closing the rebinding window. `localhost`
     // resolves locally (no network) to 127.0.0.1 / ::1, both forbidden.
@@ -828,5 +999,25 @@ mod ssrf_guard_tests {
                 "opt-in must bypass the SSRF guard, got: {chain}"
             );
         }
+    }
+
+    // FILE-GATE-05: with a configured root, file:// reads must be confined to it;
+    // a target outside the root (or one that escapes via `..`/symlink) is rejected.
+    #[test]
+    fn file_root_jail_confines_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let inside = root.path().join("ok.txt");
+        std::fs::write(&inside, b"hi").unwrap();
+        assert!(enforce_file_root(&inside, root.path()).is_ok(), "in-root read must be allowed");
+
+        // A file in a sibling directory is outside the root -> rejected.
+        let other = tempfile::tempdir().unwrap();
+        let outside = other.path().join("secret.txt");
+        std::fs::write(&outside, b"x").unwrap();
+        assert!(enforce_file_root(&outside, root.path()).is_err(), "out-of-root read must be denied");
+
+        // A `..` traversal that climbs out of the root resolves outside -> rejected.
+        let escape = root.path().join("..").join(other.path().file_name().unwrap()).join("secret.txt");
+        assert!(enforce_file_root(&escape, root.path()).is_err(), "traversal escape must be denied");
     }
 }
