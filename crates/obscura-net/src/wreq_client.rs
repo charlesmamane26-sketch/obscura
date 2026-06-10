@@ -160,7 +160,7 @@ impl StealthHttpClient {
             }
 
             self.in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let resp = req.send().await.map_err(|e| {
+            let mut resp = req.send().await.map_err(|e| {
                 self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 ObscuraNetError::Network(format!("{}: {} (source: {:?})", current_url, e, e.source()))
             })?;
@@ -194,20 +194,37 @@ impl StealthHttpClient {
                 }
             }
 
-            // NAVDOS-02: bound host memory by the declared Content-Length.
-            // (Chunked bodies without a Content-Length still read in full here; a
-            // streaming cap for the wreq path is a follow-up.)
+            // DOS-WREQ: bound host memory by a TRUE streaming cap, not just the
+            // declared Content-Length. A chunked / no-Content-Length / lying-length
+            // body would otherwise be read in full by `resp.bytes()` and OOM the
+            // host. Keep the Content-Length value only as a cheap early reject;
+            // the streaming loop below (mirroring `read_body_capped` on the reqwest
+            // path) is the real bound.
+            let max = crate::client::max_response_body();
             if let Some(len) = resp.content_length() {
-                if len as usize > crate::client::max_response_body() {
+                if len as usize > max {
                     return Err(ObscuraNetError::Network(format!(
                         "Response body too large: {} bytes",
                         len
                     )));
                 }
             }
-            let body = resp.bytes().await.map_err(|e| {
+            let mut body: Vec<u8> = Vec::new();
+            while let Some(chunk) = resp.chunk().await.map_err(|e| {
                 ObscuraNetError::Network(format!("Failed to read body: {}", e))
-            })?.to_vec();
+            })? {
+                let remaining = max.saturating_sub(body.len());
+                if remaining == 0 {
+                    tracing::warn!("Stealth response body exceeded {} bytes; truncated", max);
+                    break;
+                }
+                if chunk.len() > remaining {
+                    body.extend_from_slice(&chunk[..remaining]);
+                    tracing::warn!("Stealth response body exceeded {} bytes; truncated", max);
+                    break;
+                }
+                body.extend_from_slice(&chunk);
+            }
 
             return Ok(Response {
                 url: current_url,
