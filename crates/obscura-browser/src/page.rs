@@ -246,11 +246,9 @@ impl Page {
     async fn do_fetch(&self, url: &Url, initiator: Option<&Url>) -> Result<Response, ObscuraNetError> {
         #[cfg(feature = "stealth")]
         if let Some(ref stealth) = self.stealth_client {
-            // The stealth (wreq) client does not yet thread the initiator, so it
-            // keeps the legacy send-all behaviour (SameSite enforcement is a
-            // follow-up for the stealth path). Default path enforces below.
-            let _ = initiator;
-            return stealth.fetch(url).await;
+            // COOK-04: the stealth (wreq) client enforces SameSite at parity with
+            // the default path, using the same initiating-site context.
+            return stealth.fetch_with_initiator(url, initiator).await;
         }
         self.http_client.fetch_with_initiator(url, initiator).await
     }

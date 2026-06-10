@@ -123,6 +123,17 @@ impl StealthHttpClient {
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_initiator(url, None).await
+    }
+
+    /// Like [`Self::fetch`] but carries the initiating site so SameSite cookies
+    /// are enforced at egress (COOK-04), at parity with the reqwest client.
+    /// `initiator = None` = user/CDP-initiated (same-site, all cookies sent).
+    pub async fn fetch_with_initiator(
+        &self,
+        url: &Url,
+        initiator: Option<&Url>,
+    ) -> Result<Response, ObscuraNetError> {
         let mut current_url = url.clone();
 
         if let Some(host) = current_url.host_str() {
@@ -150,7 +161,14 @@ impl StealthHttpClient {
 
             let mut req = self.client.get(current_url.as_str());
 
-            let cookie_header = self.cookie_jar.get_cookie_header(&current_url);
+            // COOK-04: stealth fetch is GET-only; enforce SameSite using the
+            // initiating site, at parity with the reqwest navigation client.
+            let ss_ctx = crate::client::nav_same_site_context(
+                initiator,
+                &current_url,
+                &reqwest::Method::GET,
+            );
+            let cookie_header = self.cookie_jar.get_cookie_header_ctx(&current_url, ss_ctx);
             if !cookie_header.is_empty() {
                 req = req.header("Cookie", &cookie_header);
             }

@@ -310,7 +310,7 @@ pub async fn read_body_capped(
 /// behaviour). For a page-initiated navigation, a cross-site destination
 /// withholds `Strict` always and `Lax` on unsafe methods; a safe (GET/HEAD)
 /// top-level cross-site navigation still sends `Lax`, matching browsers.
-fn nav_same_site_context(
+pub(crate) fn nav_same_site_context(
     initiator: Option<&Url>,
     dest: &Url,
     method: &Method,
