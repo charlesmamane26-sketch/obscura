@@ -113,9 +113,12 @@
 
 ## Non-security note — LGPL-3.0 in the stealth feature
 Enabling `--features stealth` pulls `wreq-util` (LGPL-3.0, weak copyleft); the
-default build is fully permissive. Distributing a statically-linked stealth binary
-carries LGPL relinking obligations. This is a licensing decision, not a
-vulnerability, and is documented in the project README.
+default build is fully permissive. To keep every distributed artifact permissive,
+this fork builds its **official binaries (release + Docker) without stealth** and
+treats stealth as **build-from-source only** (no LGPL code is shipped); building
+stealth for one's own use carries no distribution obligation. This is a licensing
+decision, not a vulnerability, documented in the README. The upstream maintainer
+may wish to adopt the same stance.
 
 ---
 

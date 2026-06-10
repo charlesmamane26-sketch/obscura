@@ -71,9 +71,12 @@ jobs:
         # Cargo.lock, never a silently-newer dependency set (SUPPLY-02).
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Build stealth
-        run: cargo build --release --locked --target ${{ matrix.target }} --features stealth
-        continue-on-error: true
+      # Stealth (--features stealth) is intentionally NOT built or shipped here:
+      # it pulls wreq-util (LGPL-3.0), and distributing a statically-linked stealth
+      # binary would carry LGPL relinking obligations. Official binaries stay fully
+      # permissive (Apache-2.0 + permissive deps); stealth is build-from-source
+      # (`cargo build --features stealth`), where no distribution obligation applies.
+      # Stealth still compiles+tests in ci.yml's dedicated job.
 
       - name: Package (Unix)
         if: runner.os != 'Windows'

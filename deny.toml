@@ -54,11 +54,12 @@ private = { ignore = true }
 # only for the named crate so the gate still enforces every other dependency.
 exceptions = [
     # wreq-util ships the TLS-fingerprint emulation tables for the OPTIONAL
-    # `stealth` feature and is LGPL-3.0 (weak copyleft). It is absent from the
-    # default build. ⚠ REVIEW: shipping a statically-linked `--features stealth`
-    # binary carries LGPL-3.0 relinking obligations; the default binary is
-    # unaffected. Accepted here so the licenses gate stays green while the policy
-    # decision is made — do NOT broaden this to a blanket LGPL-3.0 allow.
+    # `stealth` feature and is LGPL-3.0 (weak copyleft). DECISION: stealth is
+    # build-from-source only — the official binaries (release + Docker) are built
+    # WITHOUT it and stay fully permissive, so this LGPL code is never distributed
+    # in a project artifact. This scoped exception only keeps the source-tree
+    # `--all-features` license check green; do NOT broaden it to a blanket
+    # LGPL-3.0 allow.
     { crate = "wreq-util", allow = ["LGPL-3.0"] },
 ]
 

@@ -423,16 +423,18 @@ Optional flags (both transports):
 
 Apache 2.0
 
-**Stealth feature licensing note.** The default build is fully permissive
-(Apache-2.0 plus permissive dependencies). The optional `--features stealth`
-build additionally pulls in `wreq-util` (the TLS-fingerprint emulation tables),
-which is licensed **LGPL-3.0** (weak copyleft). The default, non-stealth binaries
-are unaffected. If you **distribute** a statically-linked `--features stealth`
-binary, LGPL-3.0 requires that recipients be able to relink against a modified
-`wreq-util` — e.g. ship the build inputs / object files or otherwise provide the
-means to relink. Building stealth for your own use carries no such obligation.
-This dependency is surfaced as a scoped exception in `deny.toml` (see its
-`⚠ REVIEW` note); CI's `cargo deny check ... licenses` still gates every other
-dependency against the permissive allow-list.
+**Stealth feature licensing note.** The project and its **official binaries**
+(the release archives and the Docker image) are fully permissive — Apache-2.0
+plus permissive dependencies — and contain no copyleft code. The optional
+`--features stealth` build additionally pulls in `wreq-util` (the TLS-fingerprint
+emulation tables), which is **LGPL-3.0** (weak copyleft), so **stealth is
+build-from-source only** (`cargo build --features stealth`); we do not ship
+prebuilt stealth binaries. Building stealth for your own use carries no
+distribution obligation. If *you* distribute a statically-linked stealth binary,
+LGPL-3.0 requires that recipients be able to relink against a modified
+`wreq-util` (ship the object files / build inputs, plus the library's source and
+license). CI's `cargo deny check ... licenses` gates every other dependency
+against the permissive allow-list; the LGPL-3.0 `wreq-util` is a scoped exception
+in `deny.toml` used only for the source-tree all-features check.
 
 ---
