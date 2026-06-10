@@ -52,7 +52,7 @@ impl Page {
             escaped
         );
         let val = self.evaluate(&js);
-        nid_from_value(&val).map(|nid| Element { node_id: nid, page: self as *const Page })
+        nid_from_value(&val).map(|nid| Element { node_id: nid })
     }
 
     /// Wait for CSS selector to appear (polls every 100ms).
@@ -70,7 +70,7 @@ impl Page {
             );
             let val = self.evaluate(&js);
             if let Some(nid) = nid_from_value(&val) {
-                return Ok(Element { node_id: nid, page: self as *const Page });
+                return Ok(Element { node_id: nid });
             }
             if start.elapsed() > timeout {
                 return Err(Error::Timeout(format!(
@@ -95,16 +95,19 @@ impl Page {
 
 /// Handle to a DOM element.
 ///
-/// Created via [`Page::query_selector`] or [`Page::wait_for_selector`].
+/// Created via [`Page::query_selector`] or [`Page::wait_for_selector`]. The
+/// handle is just the element's node id; pass the owning [`Page`] back in to act
+/// on it. (UNSAFE-PAGE-01: it previously cached a `*const Page` and reconstructed
+/// a `&mut Page` from it, which could alias another live `&mut Page` — undefined
+/// behaviour. Taking `&mut Page` explicitly lets the borrow checker prove there
+/// is only ever one mutable borrow.)
 pub struct Element {
     node_id: u64,
-    page: *const Page,
 }
 
 impl Element {
     /// Get text content of this element.
-    pub fn text(&self) -> String {
-        let page = unsafe { &mut *(self.page as *mut Page) };
+    pub fn text(&self, page: &mut Page) -> String {
         let val = page.evaluate(&format!(
             "(function() {{ var el = globalThis._wrap && globalThis._wrap({}); return el ? el.textContent : ''; }})()",
             self.node_id
@@ -113,8 +116,7 @@ impl Element {
     }
 
     /// Get an attribute value.
-    pub fn attribute(&self, name: &str) -> Option<String> {
-        let page = unsafe { &mut *(self.page as *mut Page) };
+    pub fn attribute(&self, page: &mut Page, name: &str) -> Option<String> {
         let val = page.evaluate(&format!(
             "(function() {{ var el = globalThis._wrap && globalThis._wrap({}); return el ? el.getAttribute('{}') : null; }})()",
             self.node_id, name
@@ -123,8 +125,7 @@ impl Element {
     }
 
     /// Click this element.
-    pub fn click(&self) -> Result<(), Error> {
-        let page = unsafe { &mut *(self.page as *mut Page) };
+    pub fn click(&self, page: &mut Page) -> Result<(), Error> {
         // Scroll into view
         page.evaluate(&format!(
             "(function() {{ var el = globalThis._wrap && globalThis._wrap({}); if (el) el.scrollIntoView({{block:'center'}}); }})()",

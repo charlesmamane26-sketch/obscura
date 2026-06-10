@@ -191,9 +191,10 @@ impl Page {
             // http://, which only works when the upstream happens to be a
             // Clash-style mixed-mode proxy and breaks plain SOCKS5 servers
             // like `ssh -ND` (#160).
-            Some(Arc::new(StealthHttpClient::with_proxy(
+            Some(Arc::new(StealthHttpClient::with_proxy_and_network(
                 context.cookie_jar.clone(),
                 context.proxy_url.as_deref(),
+                context.allow_private_network,
             )))
         } else {
             None
@@ -242,12 +243,14 @@ impl Page {
         false
     }
 
-    async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
+    async fn do_fetch(&self, url: &Url, initiator: Option<&Url>) -> Result<Response, ObscuraNetError> {
         #[cfg(feature = "stealth")]
         if let Some(ref stealth) = self.stealth_client {
-            return stealth.fetch(url).await;
+            // COOK-04: the stealth (wreq) client enforces SameSite at parity with
+            // the default path, using the same initiating-site context.
+            return stealth.fetch_with_initiator(url, initiator).await;
         }
-        self.http_client.fetch(url).await
+        self.http_client.fetch_with_initiator(url, initiator).await
     }
     fn init_js(&mut self) {
         // Drop any existing runtime so the JS realm starts clean on
@@ -833,9 +836,12 @@ impl Page {
         let mut current_url = url_str.to_string();
         let mut current_method = method.to_string();
         let mut current_body = body.to_string();
+        // COOK-04: the first navigation is user/CDP-initiated (no web initiator);
+        // each later JS-triggered hop is initiated by the previously-loaded document.
+        let mut initiator: Option<Url> = None;
         const REDIRECT_LIMIT: usize = 10;
         for chain in 0..REDIRECT_LIMIT {
-            self.navigate_single(&current_url, wait_until, &current_method, &current_body).await?;
+            self.navigate_single(&current_url, wait_until, &current_method, &current_body, initiator.as_ref()).await?;
             if let Some((next_url, next_method, next_body)) = self.take_pending_navigation() {
                 if cross_scheme_to_file(&current_url, &next_url) {
                     // SOP gate. A web page must not be able to drive
@@ -852,6 +858,7 @@ impl Page {
                     break;
                 }
                 tracing::info!("JS-triggered navigation chain: {} {} -> {}", current_method, current_url, next_url);
+                initiator = Url::parse(&current_url).ok();
                 current_url = next_url;
                 current_method = next_method;
                 current_body = next_body;
@@ -875,6 +882,7 @@ impl Page {
         wait_until: crate::lifecycle::WaitUntil,
         method: &str,
         body: &str,
+        initiator: Option<&Url>,
     ) -> Result<(), PageError> {
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
 
@@ -940,9 +948,9 @@ impl Page {
             headers.insert("content-type".to_string(), content_type);
             Ok(obscura_net::Response { url: url.clone(), status: 200, headers, body: body_bytes, redirected_from: Vec::new() })
         } else if method == "POST" {
-            self.http_client.post_form(&url, body).await
+            self.http_client.post_form_navigation(&url, body, initiator).await
         } else {
-            self.do_fetch(&url).await
+            self.do_fetch(&url, initiator).await
         }.map_err(|e| {
             self.lifecycle = LifecycleState::Failed;
             PageError::NetworkError(e.to_string())

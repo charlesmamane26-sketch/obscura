@@ -232,6 +232,16 @@ pub async fn handle(
     }
 }
 
+/// Hard ceiling on CDP DOM serialization recursion, independent of the
+/// client-supplied `depth` (DOS-DOM-CDP-1). `DOM.getDocument`/`describeNode` map
+/// the conventional `depth:-1` ("entire subtree") to `u32::MAX`, so without this
+/// ceiling `serialize_node` recurses to the full DOM nesting depth and a hostile
+/// deep tree (e.g. `'<div>'.repeat(100000)`, A1) overflows the native stack and
+/// aborts the whole engine — uncatchable on this no-`catch_unwind` CDP path.
+/// Mirrors obscura-dom's `MAX_SERIALIZE_DEPTH`; deeper nodes are truncated
+/// (their `childNodeCount` is still reported).
+const MAX_CDP_SERIALIZE_DEPTH: u32 = 1000;
+
 fn serialize_node(dom: &DomTree, node_id: NodeId, max_depth: u32, current_depth: u32) -> Value {
     let node = match dom.get_node(node_id) {
         Some(n) => n,
@@ -275,7 +285,10 @@ fn serialize_node(dom: &DomTree, node_id: NodeId, max_depth: u32, current_depth:
         }
     }
 
-    if current_depth < max_depth && !children_ids.is_empty() {
+    if current_depth < max_depth
+        && current_depth < MAX_CDP_SERIALIZE_DEPTH
+        && !children_ids.is_empty()
+    {
         let children: Vec<Value> = children_ids.iter()
             .map(|&cid| serialize_node(dom, cid, max_depth, current_depth + 1)).collect();
         result["children"] = json!(children);

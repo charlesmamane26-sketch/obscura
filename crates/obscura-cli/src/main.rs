@@ -23,7 +23,10 @@ struct Args {
     #[arg(short, long, default_value_t = 9222)]
     port: u16,
 
-    #[arg(long, global = true)]
+    // `env` lets the multi-worker load balancer hand the proxy to its worker
+    // processes via OBSCURA_PROXY instead of a world-readable --proxy argv
+    // (OPS-CFG-N4).
+    #[arg(long, global = true, env = "OBSCURA_PROXY")]
     proxy: Option<String>,
 
     #[arg(long)]
@@ -169,6 +172,14 @@ enum Command {
 
         #[arg(long)]
         stealth: bool,
+
+        /// Allow MCP clients to navigate to file:// URLs. Off by
+        /// default so an MCP client (or a web page that can reach the
+        /// MCP HTTP port) cannot read arbitrary local files via
+        /// browser_navigate + browser_snapshot. Mirrors `serve
+        /// --allow-file-access`; enable only for trusted local-HTML use.
+        #[arg(long)]
+        allow_file_access: bool,
     },
 
 }
@@ -226,7 +237,18 @@ fn is_quiet_command(cmd: &Option<Command>) -> bool {
 }
 
 fn merge_proxy(global_proxy: Option<String>, command_proxy: Option<String>) -> Option<String> {
-    command_proxy.or(global_proxy)
+    // Drop empty values so an `OBSCURA_PROXY=` in the environment (or an empty
+    // pass-through) doesn't become a Some("") that fails proxy parsing.
+    command_proxy.or(global_proxy).filter(|p| !p.trim().is_empty())
+}
+
+/// Loopback literals that keep the unauthenticated control plane off the network.
+fn host_is_loopback(host: &str) -> bool {
+    let h = host.trim();
+    h.eq_ignore_ascii_case("localhost")
+        || h.parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
 }
 
 /// Normalize a raw `--v8-flags` value into the string we'll hand to V8.
@@ -308,6 +330,17 @@ async fn main() -> anyhow::Result<()> {
         unsafe { std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1"); }
     }
 
+    // OPS-CFG-N3: the SSRF guard can be turned off by the flag OR an inherited
+    // OBSCURA_ALLOW_PRIVATE_NETWORK (shell, Docker ENV, CI). Make that loud at
+    // startup so an operator can't believe SSRF protection is on while it isn't.
+    if obscura_net::env_allows_private_network() {
+        tracing::warn!(
+            "SSRF guard DISABLED: private / loopback / link-local / cloud-metadata fetches are \
+             permitted (--allow-private-network or OBSCURA_ALLOW_PRIVATE_NETWORK). Do not use this \
+             in production."
+        );
+    }
+
     let global_proxy = args.proxy.clone();
 
     match args.command {
@@ -318,7 +351,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("Storage dir: {}", dir.display());
             }
             if let Some(ref proxy) = proxy {
-                tracing::info!("Using proxy: {}", proxy);
+                tracing::info!("Using proxy: {}", obscura_net::redact_proxy(proxy));
             }
             if let Some(ref ua) = user_agent {
                 tracing::info!("User-Agent: {}", ua);
@@ -333,9 +366,29 @@ async fn main() -> anyhow::Result<()> {
             }
 
             if workers > 1 {
+                // OPS-CFG gap: multi-worker mode ignores --host and binds the
+                // load balancer to 127.0.0.1 only. Surface that rather than
+                // silently dropping a non-loopback --host.
+                if !host_is_loopback(&host) {
+                    tracing::warn!(
+                        "--host '{}' is ignored with --workers > 1; the load balancer binds 127.0.0.1 only",
+                        host
+                    );
+                }
                 tracing::info!("{} worker processes", workers);
                 run_multi_worker_serve(port, workers, proxy, stealth, user_agent).await?;
             } else {
+                // HOST-0000-1: the CDP control plane has NO auth, so a non-loopback
+                // bind exposes full unauthenticated control (cookie exfil, arbitrary
+                // JS, and file read if --allow-file-access) to the network.
+                if !host_is_loopback(&host) {
+                    tracing::warn!(
+                        "Binding to non-loopback host '{}': the CDP control plane is UNAUTHENTICATED — \
+                         anyone who can reach {}:{} can read the cookie jar and run arbitrary JS. Use \
+                         only behind a firewall on a trusted network.",
+                        host, host, port
+                    );
+                }
                 obscura_cdp::start_with_full_serve_options(
                     port, &host, proxy, stealth, user_agent, allow_file_access, storage_dir,
                     args.allow_private_network,
@@ -348,18 +401,18 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Scrape { urls, eval, concurrency, format, timeout, quiet }) => {
             run_parallel_scrape(urls, eval, concurrency.get(), &format, timeout, quiet, global_proxy).await?;
         }
-        Some(Command::Mcp { http, host, port, proxy, user_agent, stealth }) => {
+        Some(Command::Mcp { http, host, port, proxy, user_agent, stealth, allow_file_access }) => {
             let mcp_proxy = merge_proxy(global_proxy.clone(), proxy);
             if http {
-                obscura_mcp::http::run(host, port, mcp_proxy, user_agent, stealth).await?;
+                obscura_mcp::http::run(host, port, mcp_proxy, user_agent, stealth, allow_file_access).await?;
             } else {
-                obscura_mcp::run(mcp_proxy, user_agent, stealth).await?;
+                obscura_mcp::run(mcp_proxy, user_agent, stealth, allow_file_access).await?;
             }
         }
         None => {
             print_banner(args.port);
             if let Some(ref proxy) = args.proxy {
-                tracing::info!("Using proxy: {}", proxy);
+                tracing::info!("Using proxy: {}", obscura_net::redact_proxy(proxy));
             }
             obscura_cdp::start_with_options(args.port, args.proxy, false).await?;
         }
@@ -382,11 +435,28 @@ async fn run_multi_worker_serve(
     let mut children = Vec::new();
 
     for i in 0..workers {
-        let worker_port = port + 1 + i;
+        // OVERFLOW-WORKERPORT-01: `port + 1 + i` on u16 panics in debug / wraps to
+        // a privileged low port in release when --port is near 65535. Reject it
+        // with a clear error instead.
+        let worker_port = port
+            .checked_add(1)
+            .and_then(|p| p.checked_add(i))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "worker port overflow: --port {} + {} workers exceeds 65535; lower --port or --workers",
+                    port,
+                    workers
+                )
+            })?;
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg("serve").arg("--port").arg(worker_port.to_string());
         if let Some(ref p) = proxy {
-            cmd.arg("--proxy").arg(p);
+            // OPS-CFG-N4: hand the proxy to the worker via the environment, not a
+            // --proxy argv. Process command lines are world-readable
+            // (/proc/<pid>/cmdline, ps, wmic), so argv would leak proxy creds to
+            // other local users. The worker picks it up via the OBSCURA_PROXY
+            // env fallback on the global --proxy arg.
+            cmd.env("OBSCURA_PROXY", p);
         }
         if let Some(ref ua) = user_agent {
             cmd.arg("--user-agent").arg(ua);
@@ -412,7 +482,9 @@ async fn run_multi_worker_serve(
 
     loop {
         let (client_stream, peer_addr) = listener.accept().await?;
-        let worker_port = port + 1 + (next_worker % workers);
+        // Bounded by the spawn loop above (already validated non-overflowing);
+        // saturating_add keeps it panic-free regardless.
+        let worker_port = port.saturating_add(1).saturating_add(next_worker % workers);
         next_worker = next_worker.wrapping_add(1);
 
         tracing::debug!("Routing {} to worker port {}", peer_addr, worker_port);

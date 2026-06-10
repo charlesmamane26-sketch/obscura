@@ -1,0 +1,69 @@
+# cargo-deny configuration — https://embarkstudios.github.io/cargo-deny/
+# CI runs: cargo deny check advisories bans sources licenses (with --all-features)
+
+[graph]
+# Evaluate the FULL feature graph — including the optional `stealth` feature, which
+# pulls the wreq / BoringSSL tree — so the checks below match CI's --all-features
+# run and a license/advisory in an optional feature can't slip past a local check.
+all-features = true
+
+[advisories]
+# Real vulnerabilities fail the build. The advisories below are *unmaintained*
+# notices for transitive crates with no available fix; they are explicitly
+# accepted until the upstream parents drop them.
+ignore = [
+    "RUSTSEC-2025-0141", # bincode 1.x unmaintained — transitive via deno_core
+    "RUSTSEC-2025-0057", # fxhash unmaintained      — transitive via selectors
+    "RUSTSEC-2024-0436", # paste unmaintained       — transitive via v8
+]
+
+[bans]
+# Duplicate transitive versions are build-time bloat, not a security issue, and
+# are largely outside our control (deno_core / v8 / reqwest trees). Surface them
+# without failing the build.
+multiple-versions = "warn"
+wildcards = "allow"
+
+[licenses]
+# Permissive allow-list, enforced in CI (DENY-NO-LICENSES-N4):
+# `cargo deny check ... licenses`.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CC0-1.0",
+    "BSL-1.0",
+    "OpenSSL",
+    # webpki-roots ships the Mozilla CA bundle DATA under CDLA-Permissive-2.0
+    # (a permissive data license); pulled in transitively via reqwest/rustls.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+# The workspace's own crates are unpublished and carry the repo Apache-2.0 license
+# (workspace.package.license) without restating it per-crate; ignore them rather
+# than have cargo-deny flag them "unlicensed".
+private = { ignore = true }
+# SCOPED exceptions — licenses NOT in the permissive allow-list above, accepted
+# only for the named crate so the gate still enforces every other dependency.
+exceptions = [
+    # wreq-util ships the TLS-fingerprint emulation tables for the OPTIONAL
+    # `stealth` feature and is LGPL-3.0 (weak copyleft). DECISION: stealth is
+    # build-from-source only — the official binaries (release + Docker) are built
+    # WITHOUT it and stay fully permissive, so this LGPL code is never distributed
+    # in a project artifact. This scoped exception only keeps the source-tree
+    # `--all-features` license check green; do NOT broaden it to a blanket
+    # LGPL-3.0 allow.
+    { crate = "wreq-util", allow = ["LGPL-3.0"] },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

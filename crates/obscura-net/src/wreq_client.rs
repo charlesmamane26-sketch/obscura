@@ -27,15 +27,62 @@ pub struct StealthHttpClient {
     pub cookie_jar: Arc<CookieJar>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
+    /// Mirrors `ObscuraHttpClient::allow_private_network`. When false (default),
+    /// `fetch` applies the same SSRF guard as the reqwest client to the initial
+    /// URL and every redirect hop. Without this the `--stealth` path was a hole
+    /// straight through the PR#279 protections.
+    allow_private_network: bool,
+}
+
+/// `wreq` DNS resolver enforcing the same SSRF policy as the reqwest client's
+/// `SsrfDnsResolver`: it resolves the host and rejects the request if any
+/// resolved address is forbidden, so `wreq` connects only to vetted addresses.
+/// This closes DNS rebinding on the stealth path; IP-literal hosts never reach a
+/// custom resolver and are caught by `validate_url` in `fetch`.
+#[cfg(feature = "stealth")]
+struct StealthSsrfResolver {
+    allow_private_network: bool,
+}
+
+#[cfg(feature = "stealth")]
+impl wreq::dns::Resolve for StealthSsrfResolver {
+    fn resolve(&self, name: wreq::dns::Name) -> wreq::dns::Resolving {
+        let allow = self.allow_private_network || crate::client::env_allows_private_network();
+        Box::pin(async move {
+            let host = name.as_str().to_owned();
+            let addrs: Vec<std::net::SocketAddr> =
+                tokio::net::lookup_host((host.as_str(), 0))
+                    .await
+                    .map_err(|e| -> Box<dyn Error + Send + Sync> { Box::new(e) })?
+                    .collect();
+            if !allow {
+                if let Some(bad) = addrs.iter().find(|a| crate::client::is_forbidden_ip(&a.ip())) {
+                    let bad_ip = bad.ip();
+                    return Err(Box::<dyn Error + Send + Sync>::from(format!(
+                        "SSRF blocked: '{host}' resolves to forbidden address {bad_ip}"
+                    )));
+                }
+            }
+            Ok(Box::new(addrs.into_iter()) as wreq::dns::Addrs)
+        })
+    }
 }
 
 #[cfg(feature = "stealth")]
 impl StealthHttpClient {
     pub fn new(cookie_jar: Arc<CookieJar>) -> Self {
-        Self::with_proxy(cookie_jar, None)
+        Self::with_proxy_and_network(cookie_jar, None, false)
     }
 
     pub fn with_proxy(cookie_jar: Arc<CookieJar>, proxy_url: Option<&str>) -> Self {
+        Self::with_proxy_and_network(cookie_jar, proxy_url, false)
+    }
+
+    pub fn with_proxy_and_network(
+        cookie_jar: Arc<CookieJar>,
+        proxy_url: Option<&str>,
+        allow_private_network: bool,
+    ) -> Self {
         // Issue #184: `set_default_paths()` reads OpenSSL's compile-time CA
         // paths, which only resolve on Linux. On Windows the store ends up
         // empty and every TLS handshake fails with CERTIFICATE_VERIFY_FAILED.
@@ -52,6 +99,10 @@ impl StealthHttpClient {
             .emulation(emulation_opts)
             .cert_store(cert_store)
             .timeout(Duration::from_secs(30))
+            // Resolve-time SSRF guard — parity with the reqwest client. Rejects a
+            // host that resolves to a forbidden address, closing DNS rebinding on
+            // the stealth path. The literal-IP / localhost layer is validate_url.
+            .dns_resolver(StealthSsrfResolver { allow_private_network })
             .redirect(wreq::redirect::Policy::none());
 
         if let Some(proxy) = proxy_url {
@@ -67,10 +118,22 @@ impl StealthHttpClient {
             cookie_jar,
             extra_headers: RwLock::new(HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            allow_private_network,
         }
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_initiator(url, None).await
+    }
+
+    /// Like [`Self::fetch`] but carries the initiating site so SameSite cookies
+    /// are enforced at egress (COOK-04), at parity with the reqwest client.
+    /// `initiator = None` = user/CDP-initiated (same-site, all cookies sent).
+    pub async fn fetch_with_initiator(
+        &self,
+        url: &Url,
+        initiator: Option<&Url>,
+    ) -> Result<Response, ObscuraNetError> {
         let mut current_url = url.clone();
 
         if let Some(host) = current_url.host_str() {
@@ -89,9 +152,23 @@ impl StealthHttpClient {
         let mut redirects = Vec::new();
 
         for _ in 0..20 {
+            // SSRF guard — same policy as the reqwest client. Runs on the
+            // initial URL (first iteration) and on every redirect target
+            // (`current_url` is reassigned to the hop below before `continue`),
+            // so a 302 to 169.254.169.254 / 127.0.0.1 / a non-http scheme is
+            // rejected before any connection is made.
+            crate::client::validate_url(&current_url, self.allow_private_network)?;
+
             let mut req = self.client.get(current_url.as_str());
 
-            let cookie_header = self.cookie_jar.get_cookie_header(&current_url);
+            // COOK-04: stealth fetch is GET-only; enforce SameSite using the
+            // initiating site, at parity with the reqwest navigation client.
+            let ss_ctx = crate::client::nav_same_site_context(
+                initiator,
+                &current_url,
+                &reqwest::Method::GET,
+            );
+            let cookie_header = self.cookie_jar.get_cookie_header_ctx(&current_url, ss_ctx);
             if !cookie_header.is_empty() {
                 req = req.header("Cookie", &cookie_header);
             }
@@ -101,7 +178,7 @@ impl StealthHttpClient {
             }
 
             self.in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let resp = req.send().await.map_err(|e| {
+            let mut resp = req.send().await.map_err(|e| {
                 self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 ObscuraNetError::Network(format!("{}: {} (source: {:?})", current_url, e, e.source()))
             })?;
@@ -135,9 +212,37 @@ impl StealthHttpClient {
                 }
             }
 
-            let body = resp.bytes().await.map_err(|e| {
+            // DOS-WREQ: bound host memory by a TRUE streaming cap, not just the
+            // declared Content-Length. A chunked / no-Content-Length / lying-length
+            // body would otherwise be read in full by `resp.bytes()` and OOM the
+            // host. Keep the Content-Length value only as a cheap early reject;
+            // the streaming loop below (mirroring `read_body_capped` on the reqwest
+            // path) is the real bound.
+            let max = crate::client::max_response_body();
+            if let Some(len) = resp.content_length() {
+                if len as usize > max {
+                    return Err(ObscuraNetError::Network(format!(
+                        "Response body too large: {} bytes",
+                        len
+                    )));
+                }
+            }
+            let mut body: Vec<u8> = Vec::new();
+            while let Some(chunk) = resp.chunk().await.map_err(|e| {
                 ObscuraNetError::Network(format!("Failed to read body: {}", e))
-            })?.to_vec();
+            })? {
+                let remaining = max.saturating_sub(body.len());
+                if remaining == 0 {
+                    tracing::warn!("Stealth response body exceeded {} bytes; truncated", max);
+                    break;
+                }
+                if chunk.len() > remaining {
+                    body.extend_from_slice(&chunk[..remaining]);
+                    tracing::warn!("Stealth response body exceeded {} bytes; truncated", max);
+                    break;
+                }
+                body.extend_from_slice(&chunk);
+            }
 
             return Ok(Response {
                 url: current_url,
@@ -161,5 +266,29 @@ impl StealthHttpClient {
 
     pub fn is_network_idle(&self) -> bool {
         self.active_requests() == 0
+    }
+}
+
+#[cfg(all(test, feature = "stealth"))]
+mod tests {
+    use super::*;
+    use wreq::dns::Resolve;
+
+    // The resolve-time guard must reject a hostname that resolves to loopback,
+    // closing DNS rebinding on the stealth path. `localhost` resolves locally
+    // (no network) to 127.0.0.1 / ::1, both forbidden.
+    #[tokio::test]
+    async fn ssrf_resolver_rejects_host_resolving_to_loopback() {
+        let guarded = StealthSsrfResolver { allow_private_network: false };
+        assert!(
+            guarded.resolve(wreq::dns::Name::from("localhost")).await.is_err(),
+            "a host resolving to loopback must be rejected at resolve time"
+        );
+
+        let permissive = StealthSsrfResolver { allow_private_network: true };
+        assert!(
+            permissive.resolve(wreq::dns::Name::from("localhost")).await.is_ok(),
+            "allow_private_network must bypass the resolve-time guard"
+        );
     }
 }

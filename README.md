@@ -280,7 +280,8 @@ The full benchmark suite (WPT conformance, obstacle course, real-world corpus, a
 
 ## Stealth Mode
 
-Enable with `--features stealth`.
+Enable with `--features stealth`. **Licensing:** this feature pulls an LGPL-3.0
+dependency — see the [License](#license) note before distributing stealth binaries.
 
 ### Anti-fingerprinting
 - Per-session fingerprint randomization (GPU, screen, canvas, audio, battery)
@@ -421,5 +422,19 @@ Optional flags (both transports):
 ## License
 
 Apache 2.0
+
+**Stealth feature licensing note.** The project and its **official binaries**
+(the release archives and the Docker image) are fully permissive — Apache-2.0
+plus permissive dependencies — and contain no copyleft code. The optional
+`--features stealth` build additionally pulls in `wreq-util` (the TLS-fingerprint
+emulation tables), which is **LGPL-3.0** (weak copyleft), so **stealth is
+build-from-source only** (`cargo build --features stealth`); we do not ship
+prebuilt stealth binaries. Building stealth for your own use carries no
+distribution obligation. If *you* distribute a statically-linked stealth binary,
+LGPL-3.0 requires that recipients be able to relink against a modified
+`wreq-util` (ship the object files / build inputs, plus the library's source and
+license). CI's `cargo deny check ... licenses` gates every other dependency
+against the permissive allow-list; the LGPL-3.0 `wreq-util` is a scoped exception
+in `deny.toml` used only for the source-tree all-features check.
 
 ---

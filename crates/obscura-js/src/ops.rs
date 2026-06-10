@@ -509,6 +509,13 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_millis(timeout_ms))
+        // Resolve-time SSRF guard, identical to the navigation client: rejects
+        // any host that resolves to a forbidden address, closing DNS rebinding
+        // for page-JS fetch()/XHR and the dynamic ES module loader (which reuse
+        // this cached client). IP-literal targets are caught by the pre-flight
+        // validate_fetch_url. `allow_private_network` is honoured via the env
+        // var (set by --allow-private-network) inside the resolver.
+        .dns_resolver(std::sync::Arc::new(obscura_net::SsrfDnsResolver::new(false)))
         // Be explicit about pool size: default is unbounded which is fine,
         // but pool_idle_timeout default (90s) is short for SPA-heavy
         // workloads where the same origin is hit dozens of times across
@@ -516,8 +523,16 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
         .pool_idle_timeout(std::time::Duration::from_secs(300))
         .tcp_keepalive(std::time::Duration::from_secs(60));
     if let Some(proxy) = proxy_url {
-        let p = reqwest::Proxy::all(proxy)
-            .map_err(|e| format!("Invalid op_fetch_url proxy '{}': {}", proxy, e))?;
+        // OPS-04-N1: never interpolate the raw proxy URL — its userinfo (creds)
+        // would reach the page-JS realm via the returned JsErrorBox and any log.
+        // reqwest's parse error does not echo the URL, so keep it for diagnostics.
+        let p = reqwest::Proxy::all(proxy).map_err(|e| {
+            format!(
+                "Invalid op_fetch_url proxy '{}': {}",
+                obscura_net::redact_proxy(proxy),
+                e
+            )
+        })?;
         builder = builder.proxy(p);
     }
     builder
@@ -587,7 +602,12 @@ async fn op_fetch_url(
     };
 
     if let Some((tx, request_id)) = intercept_tx {
-        let custom_headers: HashMap<String, String> = serde_json::from_str(&headers_json).unwrap_or_default();
+        let custom_headers: HashMap<String, String> =
+            serde_json::from_str::<HashMap<String, String>>(&headers_json)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(k, _)| !is_forbidden_request_header(k))
+                .collect();
         let (resolve_tx, resolve_rx) = tokio::sync::oneshot::channel();
         let intercepted = InterceptedRequest {
             request_id: request_id.clone(),
@@ -645,8 +665,14 @@ async fn op_fetch_url(
 
     let req_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
 
+    // OPS-HDR-01: strip forbidden request headers a page must not control
+    // (Host/Cookie/Referer/Origin/Sec-*/…) before they reach the wire.
     let custom_headers: std::collections::HashMap<String, String> =
-        serde_json::from_str(&headers_json).unwrap_or_default();
+        serde_json::from_str::<std::collections::HashMap<String, String>>(&headers_json)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(k, _)| !is_forbidden_request_header(k))
+            .collect();
 
     let needs_preflight = is_cross_origin
         && mode == "cors"
@@ -842,23 +868,37 @@ async fn op_fetch_url(
         }
     }
 
-    let resp_bytes = response
-        .bytes()
+    // NAVDOS / OPS-01: cap the buffered body so a hostile server cannot OOM the
+    // host with an endless/huge response to a page fetch()/XHR.
+    let resp_bytes = obscura_net::read_body_capped(response, obscura_net::max_response_body())
         .await
         .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?;
-    let resp_body = String::from_utf8_lossy(&resp_bytes).to_string();
+
+    // DOS-OPS-AMP-1: the JS shim needs both a text and a base64 view, but holding
+    // the raw bytes + text + base64 + a freshly serialized JSON copy all at once
+    // turned a capped 256 MiB body into a ~1.1 GB peak (and N concurrent fetches
+    // multiply it). Derive both views, free the raw bytes before serializing, and
+    // MOVE the strings into the JSON value (`serde_json::json!` would clone them).
     let resp_body_base64 = BASE64.encode(&resp_bytes);
+    let resp_body = String::from_utf8_lossy(&resp_bytes).into_owned();
+    drop(resp_bytes);
 
     tracing::debug!("op_fetch_url completed: {} {} ({} bytes)", method, url, resp_body.len());
 
-    Ok(serde_json::json!({
-        "status": status,
-        "body": resp_body,
-        "bodyBase64": resp_body_base64,
-        "url": url,
-        "headers": resp_headers,
-    })
-    .to_string())
+    let mut payload = serde_json::Map::new();
+    payload.insert("status".to_string(), serde_json::Value::from(status));
+    payload.insert("body".to_string(), serde_json::Value::String(resp_body));
+    payload.insert(
+        "bodyBase64".to_string(),
+        serde_json::Value::String(resp_body_base64),
+    );
+    payload.insert("url".to_string(), serde_json::Value::String(url));
+    payload.insert(
+        "headers".to_string(),
+        serde_json::to_value(resp_headers)
+            .unwrap_or_else(|_| serde_json::Value::Object(Default::default())),
+    );
+    Ok(serde_json::Value::Object(payload).to_string())
 }
 
 fn glob_match(pattern: &str, url: &str) -> bool {
@@ -877,7 +917,30 @@ fn glob_match(pattern: &str, url: &str) -> bool {
     url == pattern
 }
 
-fn validate_fetch_url(url: &url::Url) -> Result<(), String> {
+/// Headers a page must not set on fetch()/XHR (the Fetch spec "forbidden header
+/// name" set, plus engine-controlled ones). Letting page JS set these enables
+/// Host-header SSRF / vhost confusion, cookie-jar override, and referrer/origin
+/// spoofing (audit OPS-HDR-01). `user-agent` and `content-type` stay allowed
+/// (the existing UA-override and CORS-safe behaviour).
+pub(crate) fn is_forbidden_request_header(name: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    matches!(
+        n.as_str(),
+        "host" | "cookie" | "cookie2" | "referer" | "origin"
+            | "connection" | "keep-alive" | "content-length" | "transfer-encoding"
+            | "te" | "trailer" | "upgrade" | "via" | "expect" | "date"
+            | "accept-charset" | "accept-encoding" | "dnt"
+            | "access-control-request-method" | "access-control-request-headers"
+    ) || n.starts_with("sec-")
+        || n.starts_with("proxy-")
+}
+
+/// Pre-flight SSRF check for the page-JS fetch()/XHR egress (and the dynamic ES
+/// module loader). Mirrors `obscura_net::client::validate_url` exactly and reuses
+/// the same `obscura_net::is_forbidden_ip` policy. This is the IP-literal layer;
+/// resolvable hostnames are enforced at connect time by the `SsrfDnsResolver`
+/// installed on the shared client in `build_request_client` (rebinding-safe).
+pub(crate) fn validate_fetch_url(url: &url::Url) -> Result<(), String> {
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" && scheme != "file" {
         return Err(format!(
@@ -893,12 +956,7 @@ fn validate_fetch_url(url: &url::Url) -> Result<(), String> {
     if let Some(host) = url.host() {
         match host {
             url::Host::Ipv4(ip) => {
-                if ip.is_loopback()
-                    || ip.is_private()
-                    || ip.is_link_local()
-                    || ip.is_broadcast()
-                    || ip.is_documentation()
-                {
+                if obscura_net::is_forbidden_ip(&std::net::IpAddr::V4(ip)) {
                     return Err(format!(
                         "Access to private/internal IP address {} is not allowed",
                         ip
@@ -906,7 +964,7 @@ fn validate_fetch_url(url: &url::Url) -> Result<(), String> {
                 }
             }
             url::Host::Ipv6(ip) => {
-                if ip.is_loopback() || ip.is_unicast_link_local() {
+                if obscura_net::is_forbidden_ip(&std::net::IpAddr::V6(ip)) {
                     return Err(format!(
                         "Access to private/internal IPv6 address {} is not allowed",
                         ip

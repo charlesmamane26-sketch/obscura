@@ -154,6 +154,7 @@ pub async fn start_with_full_serve_options(
     // handles HTTP endpoints (/json/version, /json, /json/protocol) with
     // blocking I/O so they never contend with the LocalSet's V8 work.
     let accept_flag = shutdown_flag.clone();
+    let accept_bind_host = host.to_string();
     std::thread::Builder::new()
         .name("obscura-cdp-accept".into())
         .spawn(move || {
@@ -163,7 +164,7 @@ pub async fn start_with_full_serve_options(
                 }
                 match stream {
                     Ok(stream) => {
-                        if let Err(e) = accept_dispatch(stream, port, &ws_tx) {
+                        if let Err(e) = accept_dispatch(stream, port, &accept_bind_host, &ws_tx) {
                             if !format!("{}", e).contains("close") {
                                 error!("Accept dispatch error: {}", e);
                             }
@@ -174,6 +175,7 @@ pub async fn start_with_full_serve_options(
             }
         })?;
 
+    let bind_host = host.to_string();
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -219,8 +221,9 @@ pub async fn start_with_full_serve_options(
                     }
                 };
                 let tx = msg_tx.clone();
+                let bh = bind_host.clone();
                 tokio::task::spawn_local(async move {
-                    if let Err(e) = handle_connection_ws(tokio_stream, tx).await {
+                    if let Err(e) = handle_connection_ws(tokio_stream, tx, bh).await {
                         error!("WebSocket connection error: {}", e);
                     }
                 });
@@ -244,6 +247,7 @@ const WS_PEEK_BUF: usize = 4;
 fn accept_dispatch(
     stream: std::net::TcpStream,
     port: u16,
+    bind_host: &str,
     ws_tx: &mpsc::Sender<std::net::TcpStream>,
 ) -> anyhow::Result<()> {
     let mut buf = [0u8; WS_PEEK_BUF];
@@ -265,7 +269,7 @@ fn accept_dispatch(
         };
 
         if let Some(ep) = endpoint {
-            return handle_http_json_blocking(stream, port, ep);
+            return handle_http_json_blocking(stream, port, bind_host, ep);
         }
         // Fall through: GET request that isn't a /json endpoint → treat as
         // WebSocket upgrade (Chromium DevTools clients issue GET with
@@ -293,12 +297,43 @@ fn accept_dispatch(
 fn handle_http_json_blocking(
     mut stream: std::net::TcpStream,
     port: u16,
+    bind_host: &str,
     endpoint: &str,
 ) -> anyhow::Result<()> {
     use std::io::{Read, Write};
 
     let mut buf = vec![0u8; 4096];
-    let _ = stream.read(&mut buf)?;
+    let n = stream.read(&mut buf)?;
+
+    // CDP-JSON-1: pin the Host like the WS handshake does. Without it, the HTTP
+    // control-plane endpoints answered any Host, so after a DNS rebind
+    // (evil.com -> 127.0.0.1) a page at evil.com:9222 could read /json/list
+    // same-origin to confirm obscura is running and read the target list. No
+    // Host header (a raw native client) is allowed, matching the WS path.
+    let host_header = String::from_utf8_lossy(&buf[..n])
+        .lines()
+        .find_map(|l| {
+            let l = l.trim_start();
+            if l.len() >= 5 && l[..5].eq_ignore_ascii_case("host:") {
+                Some(l[5..].trim().to_string())
+            } else {
+                None
+            }
+        });
+    if let Some(host) = host_header {
+        if !ws_host_is_safe(&host, bind_host) {
+            warn!("CDP /json request rejected: Host '{}' not allowed", host);
+            let body = "host not allowed";
+            let resp = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            );
+            stream.write_all(resp.as_bytes())?;
+            stream.flush()?;
+            return Ok(());
+        }
+    }
 
     let body = match endpoint {
         "version" => serde_json::to_string_pretty(&json!({
@@ -496,6 +531,27 @@ async fn process_with_interception(
         }
     };
 
+    // CDP-01 / SSRF-05: the file:// gate (`--allow-file-access`) is enforced in
+    // `do_navigate` (domains/page.rs) and `Target.createTarget`, but after a
+    // normal Puppeteer/Playwright attach the session resolves, so EVERY
+    // `Page.navigate` is routed here — and this spawn path used to call
+    // `navigate_with_wait` with no gate, letting any CDP client read arbitrary
+    // local files by default. Enforce the identical gate here, before any page
+    // state is touched, so the protection cannot be skipped by the routing.
+    let nav_url = req.params.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    if crate::util::url_is_file_scheme(nav_url) && !ctx.default_context.allow_file_access {
+        let resp = crate::types::CdpResponse::error(
+            req.id,
+            -32601,
+            "Page.navigate to file:// is disabled. Restart with `obscura serve --allow-file-access` to enable.".to_string(),
+            req.session_id.clone(),
+        );
+        if let Ok(json) = serde_json::to_string(&resp) {
+            let _ = reply_tx.send(json);
+        }
+        return;
+    }
+
     tracing::info!("INTERCEPTION navigate: {} (id={})", req.method, req.id);
 
     let session_id = &req.session_id;
@@ -658,7 +714,7 @@ async fn process_with_interception(
                     "sessionId": session_for_events,
                 });
                 let event_str = event_json.to_string();
-                tracing::info!("INTERCEPTION event JSON: {}", &event_str[..event_str.len().min(300)]);
+                tracing::info!("INTERCEPTION event JSON: {}", log_truncate(&event_str, 300));
                 let _ = reply_tx.send(event_str);
                 intercepted_paused.insert(intercepted.request_id.clone(), intercepted.resolver);
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -770,7 +826,7 @@ async fn process_cdp_message(
     let req: CdpRequest = match serde_json::from_str(text) {
         Ok(r) => r,
         Err(e) => {
-            warn!("Invalid CDP: {}: {}", e, &text[..text.len().min(200)]);
+            warn!("Invalid CDP: {}: {}", e, log_truncate(&text, 200));
             return;
         }
     };
@@ -894,9 +950,63 @@ fn check_pending_navigation(ctx: &CdpContext, session_id: &Option<String>) -> Op
     page.take_pending_navigation()
 }
 
+/// Truncate `s` to at most `max` bytes on a UTF-8 char boundary (CDP-04).
+/// Slicing `&s[..max]` panics when `max` lands inside a multi-byte char, and
+/// these are debug/trace strings built from attacker-controlled CDP payloads —
+/// a panic on the connection task is a remote DoS.
+fn log_truncate(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// A browser WebSocket handshake carries an Origin; native CDP clients do not.
+/// Allow only origins explicitly listed in `OBSCURA_CDP_ALLOWED_ORIGINS`
+/// (comma-separated). Default (unset) denies every browser-originated handshake.
+fn cdp_origin_allowed(origin: &str) -> bool {
+    match std::env::var("OBSCURA_CDP_ALLOWED_ORIGINS") {
+        Ok(list) => list
+            .split(',')
+            .map(str::trim)
+            .any(|a| !a.is_empty() && a.eq_ignore_ascii_case(origin)),
+        Err(_) => false,
+    }
+}
+
+/// Host-header pinning to blunt DNS rebinding: a rebinding attack points an
+/// attacker *domain* at loopback, so a Host that is loopback / the bound host /
+/// an IP literal is accepted while a foreign domain name is rejected.
+fn ws_host_is_safe(host_header: &str, bind_host: &str) -> bool {
+    let h = host_header.trim();
+    let hostname = if let Some(rest) = h.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        h.rsplit_once(':').map(|(a, _)| a).unwrap_or(h)
+    };
+    hostname.eq_ignore_ascii_case("localhost")
+        || hostname.eq_ignore_ascii_case(bind_host)
+        || hostname.parse::<std::net::IpAddr>().is_ok()
+}
+
+fn forbidden_ws(
+    msg: &str,
+) -> tokio_tungstenite::tungstenite::handshake::server::ErrorResponse {
+    use tokio_tungstenite::tungstenite::http::{Response, StatusCode};
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .body(Some(msg.to_string()))
+        .expect("static forbidden response builds")
+}
+
 async fn handle_connection_ws(
     stream: TcpStream,
     msg_tx: mpsc::UnboundedSender<ServerMessage>,
+    bind_host: String,
 ) -> anyhow::Result<()> {
     // tokio_tungstenite wraps the stream in a 128 KiB write BufWriter by
     // default. CDP traffic is many small (~100-byte) frames, and that buffer
@@ -907,7 +1017,32 @@ async fn handle_connection_ws(
     let mut cfg = WebSocketConfig::default();
     cfg.write_buffer_size = 0;
     cfg.max_write_buffer_size = 1 << 20;
-    let ws_stream = tokio_tungstenite::accept_async_with_config(stream, Some(cfg)).await?;
+
+    // CDP-02: validate the handshake headers. The CDP port has no auth, so a web
+    // page the victim visits could otherwise `new WebSocket('ws://127.0.0.1:9222
+    // /devtools/browser')` and drive the full protocol (file read, cookie jar,
+    // engine control). A browser handshake always carries an Origin header;
+    // native CDP clients (Puppeteer/Playwright over ws://) do not. Reject any
+    // Origin not in OBSCURA_CDP_ALLOWED_ORIGINS, and pin the Host to loopback /
+    // the bound host to blunt DNS rebinding.
+    use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+    let callback = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+        let headers = req.headers();
+        if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+            if !cdp_origin_allowed(origin) {
+                warn!("CDP WS handshake rejected: Origin '{}' not allowed", origin);
+                return Err(forbidden_ws("origin not allowed"));
+            }
+        }
+        if let Some(host) = headers.get("host").and_then(|v| v.to_str().ok()) {
+            if !ws_host_is_safe(host, &bind_host) {
+                warn!("CDP WS handshake rejected: Host '{}' not allowed", host);
+                return Err(forbidden_ws("host not allowed"));
+            }
+        }
+        Ok(resp)
+    };
+    let ws_stream = tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(cfg)).await?;
     info!("WebSocket connected");
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
@@ -917,7 +1052,7 @@ async fn handle_connection_ws(
         reply_tx: reply_tx.clone(),
     });
     if let Some(init_msg) = reply_rx.recv().await {
-        tracing::debug!("Connection init: {}", &init_msg[..init_msg.len().min(100)]);
+        tracing::debug!("Connection init: {}", log_truncate(&init_msg, 100));
     }
 
     let send_task = tokio::task::spawn_local(async move {
