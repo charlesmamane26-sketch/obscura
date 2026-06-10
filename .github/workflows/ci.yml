@@ -59,7 +59,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check advisories bans sources
+          # DENY-NO-LICENSES-N4: also enforce the deny.toml [licenses] allow-list
+          # so a transitive dep under a copyleft / unknown license is caught.
+          command: check advisories bans sources licenses
 
   semgrep:
     name: Semgrep (Rust SAST)
@@ -68,8 +70,20 @@ jobs:
       image: semgrep/semgrep
     steps:
       - uses: actions/checkout@v4
-      # Informational: Rust support is experimental and semgrep cannot run on
-      # the maintainers' Windows hosts, so CI (Linux) is its natural home.
-      - name: Semgrep scan
-        run: semgrep scan --config p/rust --error
-        continue-on-error: true
+        with:
+          # Full history so the diff-aware baseline scan below can reach the PR
+          # base commit.
+          fetch-depth: 0
+      # SEMGREP-NEUTERED-N3: the scan used to carry `continue-on-error: true`, so
+      # `--error` was a no-op and a real finding never failed CI. Gate NEW findings
+      # instead: on a PR, diff against the base commit so the experimental-Rust
+      # ruleset's pre-existing noise doesn't block merges, but a newly introduced
+      # finding fails the job. On push (no PR base) it stays informational.
+      - name: Semgrep scan (new findings fail)
+        run: |
+          if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
+            semgrep scan --config p/rust --error \
+              --baseline-commit "${{ github.event.pull_request.base.sha }}"
+          else
+            semgrep scan --config p/rust --error || true
+          fi

@@ -19,8 +19,8 @@ multiple-versions = "warn"
 wildcards = "allow"
 
 [licenses]
-# Permissive allow-list (starting point — tune as the dependency tree evolves).
-# Not enforced by the default CI command yet; documented here for when it is.
+# Permissive allow-list, enforced in CI (DENY-NO-LICENSES-N4):
+# `cargo deny check ... licenses`.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -35,8 +35,15 @@ allow = [
     "CC0-1.0",
     "BSL-1.0",
     "OpenSSL",
+    # webpki-roots ships the Mozilla CA bundle DATA under CDLA-Permissive-2.0
+    # (a permissive data license); pulled in transitively via reqwest/rustls.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
+# The workspace's own crates are unpublished and carry the repo Apache-2.0 license
+# (workspace.package.license) without restating it per-crate; ignore them rather
+# than have cargo-deny flag them "unlicensed".
+private = { ignore = true }
 
 [sources]
 unknown-registry = "deny"

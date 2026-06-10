@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # ACTIONS-UNPINNED-N1: actions should be pinned to a full commit SHA (with a
+  # `# vX.Y` comment) rather than a mutable tag/branch like `@v4` or `@stable`,
+  # especially in release.yml (contents: write) and docker.yml (registry push).
+  # Pin the SHAs in a networked step; Dependabot then bumps the SHA + comment
+  # together so the pins stay current without going stale.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "security"
+
+  # Keep the Cargo dependency tree current (advisories are gated by cargo-deny).
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
